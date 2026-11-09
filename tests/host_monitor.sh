@@ -19,6 +19,12 @@ cat >"$TEMP_DIR/bin/ping" <<'EOF'
 printf '64 bytes time=1.0 ms\n'
 EOF
 chmod +x "$TEMP_DIR/bin/ping"
+cat >"$TEMP_DIR/bin/ip" <<'EOF'
+#!/usr/bin/env bash
+printf '1: lo    inet 127.0.0.1/8 scope host lo\n'
+printf '2: eth0    inet 10.204.7.20/24 brd 10.204.7.255 scope global eth0\n'
+EOF
+chmod +x "$TEMP_DIR/bin/ip"
 
 cat >"$TEMP_DIR/dhcp.conf" <<'EOF'
 host c1n1r1e1 { fixed-address 192.0.2.2; }
@@ -54,3 +60,11 @@ mixed_case_octe_line=$(grep -nF 'A_OCTE001' "$TEMP_DIR/output" | head -n 1 | cut
 ((octe_header_line < octe_host_line))
 ((octe_header_line < mixed_case_octe_line))
 printf 'host monitor OCTE ordering passed\n'
+
+core_line=$(grep -nF '[c1]' "$TEMP_DIR/output" | head -n 1 | cut -d: -f1)
+switch_line=$(grep -nF '10.204.7.134' "$TEMP_DIR/output" | head -n 1 | cut -d: -f1)
+host_line=$(grep -nF 'c1n1r1e1' "$TEMP_DIR/output" | head -n 1 | cut -d: -f1)
+[[ -n $core_line && -n $switch_line && -n $host_line ]]
+((core_line < switch_line))
+((switch_line < host_line))
+printf 'host monitor core switch passed\n'

@@ -18,6 +18,8 @@ Needs `ssh` and `sshpass`.
 
 `bin/fhm` continuously pings static hosts from ISC DHCP configs. It reads `/etc/dhcp/dhcpd.conf` plus files matching `/etc/dhcp/ansible*.conf`. Each `host` block needs a `fixed-address`. OCTE hosts appear first under `[OCTE]`. Other hosts are grouped by core (`c`), then node (`n`), with extra indent for rack (`r`) and enclosure (`e`). Names that do not match that pattern go under `[Unclassified]`.
 
+Each core also shows a core switch (`cN-core-switch`) directly under its core header. Its address uses the first three octets of the first local IPv4 address in `10.204.x.x` or `10.198.x.x`, with fourth octet `133 + N` (core 1 is `.134`, core 2 is `.135`). If no such local address exists, core switches are omitted.
+
 On a TTY it uses the alternate screen, colors UP green / DOWN red, and paginates when the list is taller than the terminal. The top banner shows the timestamp and the percentage of hosts that are UP (`UP 87% (174/200)`). Left/Right arrows change pages. Ctrl-C stops. Off a TTY it prints a snapshot each interval.
 
 ```bash

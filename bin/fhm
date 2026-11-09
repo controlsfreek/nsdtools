@@ -107,6 +107,19 @@ is_octe_host() {
     [[ $1 =~ (^|[^[:alnum:]])[oO][cC][tT][eE][0-9]+([^[:alnum:]]|$) ]]
 }
 
+# First three octets of the first local IPv4 address in 10.204.x.x or 10.198.x.x;
+# core switches live on that subnet at .134 (core 1), .135 (core 2), ...
+find_switch_prefix() {
+    local addresses
+    if command -v ip >/dev/null 2>&1; then
+        addresses=$(ip -4 -o addr show 2>/dev/null | awk '{split($4, a, "/"); print a[1]}')
+    else
+        addresses=$(hostname -I 2>/dev/null | tr ' ' '\n')
+    fi
+    awk -F. '$1 == 10 && ($2 == 204 || $2 == 198) { print $1 "." $2 "." $3; exit }' <<<"$addresses"
+}
+switch_prefix=$(find_switch_prefix)
+
 declare -a host_names=()
 declare -a host_addresses=()
 while IFS=$'\t' read -r name address; do
@@ -142,6 +155,7 @@ for index in "${!host_names[@]}"; do
 done
 previous_core=''
 previous_node=''
+core_position=0
 for index in "${!host_names[@]}"; do
     if is_octe_host "${host_names[index]}"; then
         continue
@@ -160,6 +174,15 @@ for index in "${!host_names[@]}"; do
             display_indents+=('0')
             previous_core=$core
             previous_node=''
+            core_position=$((core_position + 1))
+            if [[ -n $switch_prefix ]]; then
+                host_names+=("${core}-core-switch")
+                host_addresses+=("$switch_prefix.$((133 + core_position))")
+                display_types+=('host')
+                display_labels+=('')
+                display_host_indexes+=("$((${#host_names[@]} - 1))")
+                display_indents+=('1')
+            fi
         fi
         host_indent=1
         if [[ ! $node_value =~ ^0+$ ]]; then
@@ -278,7 +301,7 @@ while true; do
         terminal_rows=$(tput lines 2>/dev/null || printf '24')
         terminal_columns=$(tput cols 2>/dev/null || printf '80')
     else
-        terminal_rows=$((${#host_names[@]} + 4))
+        terminal_rows=$((${#display_types[@]} + 4))
         terminal_columns=80
     fi
 
