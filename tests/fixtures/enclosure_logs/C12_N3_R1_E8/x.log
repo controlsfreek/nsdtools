@@ -1,0 +1,2 @@
+Jan 10 10:00:00 ece FAIL mfr_dev MFR-0444 limit exceeded actual=1.2 limit=1.0
+Jan 10 10:00:01 ece INFO ok

@@ -1,53 +1,92 @@
-# fluencetools
+# nsdtools
 
 Tools for site and inverter work.
 
-## EPC M10 terminal HMI
+## ECE revisions
 
-`bin/epc-m10-hmi` is a **read-only** full-screen terminal HMI for [EPC Power M10](https://www.epcpower.com/products/m-system) inverters. It is implemented in **pure bash** (no Python, no `paho-mqtt`, no virtualenv).
-
-It opens an MQTT 3.1.1 session over bash `/dev/tcp`, subscribes to Sparkplug B, watches `NBIRTH` / `DBIRTH` (and death) to build a list of M10s, and opens the operator screen for the inverter you select.
-
-Other device types on the same broker are ignored (for example a BMS on the demo fleet).
-
-It never publishes. There is no MQTT PUBLISH path and no last will; it does not send Sparkplug `NCMD` / `DCMD`, and it does not act as a primary host (`STATE` is ignored). Nothing in the HMI can command an M10 or any other device on the broker.
-
-An M10 is recognized from its Sparkplug path or birth tags (device / node / model / type containing `M10`).
-
-The M10’s native control interface is Modbus TCP. Sparkplug B usually comes from a gateway in front of it, so metric names are taken from birth messages (with aliases honored on later data) rather than a hardcoded register map.
-
-### Run
-
-Requires bash 4+ with `/dev/tcp` (bash’s built-in TCP). No packages to install for the demo; live mode talks to the broker with `/dev/tcp` only (no mosquitto client).
+`bin/ece-revs.sh` reads enclosure host names from `/etc/dhcp/ansible-enclosure.conf`, keeps hosts that include an enclosure (`e`) field, skips names containing `sw` (switches), sorts them by cluster (`c`), node (`n`), then enclosure (`e`), and SSHes as `root`/`root` to each host's DHCP `fixed-address` IP (30s connect timeout). It lists every host immediately; the rightmost column shows `waiting`, `connecting` (ASCII spinner), `reading`, then the `enclosure-control-engine` version from `apt list --installed`. The table updates in place without scrolling. If the list is taller than the terminal, it uses multiple columns so every host fits on screen, without truncating HOST, IP, or status. SSH queries run in parallel (default 16) and rows stay in c/n/e order.
 
 ```bash
-# preview the selector and screen with three simulated M10s (+ one filtered BMS)
-./bin/epc-m10-hmi --demo
+./bin/ece-revs.sh
+./bin/ece-revs.sh --jobs 16
+./bin/ece-revs.sh --conf /etc/dhcp/ansible-enclosure.conf
+```
 
-# live broker — starts on the inverter list
-./bin/epc-m10-hmi --host 10.0.0.20 --port 1883
+Needs `ssh` and `sshpass`.
 
-# skip the list and open one device
-./bin/epc-m10-hmi --host 10.0.0.20 --port 1883 --device M10-A
+## fhm
+
+`bin/fhm` continuously pings static hosts from ISC DHCP configs. It reads `/etc/dhcp/dhcpd.conf` plus files matching `/etc/dhcp/ansible*.conf`. Each `host` block needs a `fixed-address`. OCTE hosts appear first under `[OCTE]`. Other hosts are grouped by core (`c`), then node (`n`), with extra indent for rack (`r`) and enclosure (`e`). Names that do not match that pattern go under `[Unclassified]`.
+
+On a TTY it uses the alternate screen, colors UP green / DOWN red, and paginates when the list is taller than the terminal. The top banner shows the timestamp and the percentage of hosts that are UP (`UP 87% (174/200)`). Left/Right arrows change pages. Ctrl-C stops. Off a TTY it prints a snapshot each interval.
+
+```bash
+./bin/fhm
+./bin/fhm -i 5 -t 1
+./bin/fhm -g '/etc/dhcp/ansible*.conf'
+```
+
+Needs `ping` and `awk`.
+
+## enclosure-mfr-report
+
+`bin/enclosure-mfr-report` collects enclosure manufacturing `*.log` files, then writes statistical and corrective-action reports.
+
+- **SSH:** `--host` prompts on a TTY for username (if omitted) and password. The password is not stored, not logged, and cannot be passed as a flag.
+- **Offline:** `--from-dir` or `--from-package` skips SSH (used by tests and re-analysis).
+- Remote default root: `/opt/fos_deployment/logs/enclosure`. Files are renamed `cCCC_nNNN_rRR_eEE_<basename>` from path tokens. Paths without an `e` token are skipped (`skipped:no-e` in the manifest).
+
+```bash
+./bin/enclosure-mfr-report --host 10.0.0.10 --user operator
+./bin/enclosure-mfr-report --from-dir tests/fixtures/enclosure_logs --out-dir /tmp/mfr-out
+./bin/enclosure-mfr-report --from-package ./package.tar.gz --out-dir ./out --keep-package
+```
+
+Outputs in `--out-dir` (default `./var/enclosure-mfr-report/<timestamp>/`): `package/`, `manifest.txt`, `deviations.csv`, `stats-report.md`, `corrective-action-report.md`, `unparsed.txt`.
+
+Requires `python3` and `tar`. SSH mode also needs `ssh` and `sshpass`. Type the password in your own terminal; do not put it in chat, argv, or files.
+
+```bash
+bash tests/enclosure_mfr_collect.sh
+python3 -m pytest tests/python -q
+```
+
+## fos-tui
+
+`bin/fos-tui` is a **read-only** terminal HMI for Fluence OS Sparkplug B traffic. Pure bash (no Python, no `paho-mqtt`). MQTT 3.1.1 over `/dev/tcp`, subscribe-only (no PUBLISH, no last will, no `NCMD`/`DCMD`, no primary host).
+
+It lists MQTT edge nodes as they publish. `↑` `↓` / `j` `k` move, `Enter` opens the HMI for that node type, `Esc` returns to the list, `q` quits.
+
+- **DAC / PCS** (`DAC` in the node name, or a metric containing `inverter01`): EPC M10 inverter screen
+- **Core SDU** (`A_C001_SDU` — core token, no node token): CoreSDU heartbeat (`Core_hb`)
+- **Node SDU** (`A_C001_N001_SDU` — core and node tokens): NodeSDU screen
+- **other**: structure + last seen (no type-specific panel yet)
+
+Sparkplug node names encode site structure (`_` tokens):
+
+- leading letter — array (for example `A`)
+- `C` + number — Core
+- `N` + number — Node
+- `SDU` — Software Dispatch Unit
+- `DAC` + number — power conversion system (PCS / inverter)
+
+Examples: `A_C001_N001_SDU`, `A_C001_N001_DAC01`, `A_C001_SDU`, `A_SDU`.
+
+```bash
+./bin/fos-tui --demo
+./bin/fos-tui
+./bin/fos-tui --host 10.0.0.3 --port 1883
+./bin/fos-tui --host 10.0.0.3 --port 1883 --device A_C001_N001_DAC01
 ```
 
 Optional: `--group`, `--node`, `--username`, `--password`, `--client-id`, `--topic`.
 
-Same values can be set with env vars: `M10_MQTT_HOST`, `M10_MQTT_PORT`, `M10_MQTT_USERNAME`, `M10_MQTT_PASSWORD`, `M10_MQTT_CLIENT_ID`, `M10_SPARKPLUG_GROUP`, `M10_SPARKPLUG_NODE`, `M10_SPARKPLUG_DEVICE`.
+Env: `FOS_TUI_MQTT_HOST`, `FOS_TUI_MQTT_PORT`, `FOS_TUI_MQTT_USERNAME`, `FOS_TUI_MQTT_PASSWORD`, `FOS_TUI_MQTT_CLIENT_ID`, `FOS_TUI_SPARKPLUG_GROUP`, `FOS_TUI_SPARKPLUG_NODE`, `FOS_TUI_SPARKPLUG_DEVICE`. Legacy `M10_*` / `CORE_SDU_*` names still work.
 
-Default subscribe topic is `spBv1.0/#`. Tags go stale after about 5 seconds without an update.
+`bin/epc-m10-hmi` and `bin/core-sdu-hmi` exec `fos-tui`. Default topic `spBv1.0/#`. Tags stale after 60s.
 
-### Keys
+Subscribe-only inventory dump:
 
-On the list: `↑` `↓` or `j` `k` move, `Enter` opens, `q` quits.
-
-On the HMI: `Esc` back to the list, `q` quits.
-
-### Layout
-
-- Selector: device, node, group, online / stale / offline (M10 only; UI shows **READ ONLY**)
-- HMI: connection badge, KPIs, DC / battery, thermal / state, alarms
-
-### Notes
-
-The previous Python / `paho-mqtt` implementation was removed. MQTT QoS is subscribe QoS 0; PUBLISH packets with QoS &gt; 0 are parsed for topic/payload but not acknowledged. The Sparkplug decoder covers the focused Metric types used by the HMI (int/float/double/bool/string); datasets, templates, and bytes are skipped.
+```bash
+./tests/list_edge_nodes.sh 127.0.0.1 1883 20
+```

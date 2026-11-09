@@ -1,0 +1,13 @@
+# Statistical manufacturing-deviation report
+## Collection metadata
+## Counts by deviation code
+## Counts by severity
+## Top deviation codes
+## Per-enclosure
+## Numeric limits by code
+c1/n2/r3/e4
+c1/n2/r1/e3
+c12/n3/r1/e8
+MFR-0123
+MFR-0001
+MFR-0444

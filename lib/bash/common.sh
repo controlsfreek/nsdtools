@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Shared constants, ANSI palette, CLI parsing, device state helpers.
 
-STALE_AFTER=5
+STALE_AFTER=60
 
 RESET=$'\033[0m'
 BOLD=$'\033[1m'
@@ -26,31 +26,98 @@ C_AMBER=$'\033[38;5;178m'
 C_HEAD=$'\033[38;5;81m'
 
 # Device / metric state (associative)
-declare -A DEV_GROUP DEV_NODE DEV_DEVICE DEV_ONLINE DEV_LAST DEV_SEQ DEV_IS_M10 DEV_BORN
+declare -A DEV_GROUP DEV_NODE DEV_DEVICE DEV_ONLINE DEV_LAST DEV_SEQ DEV_IS_M10 DEV_IS_BMS DEV_IS_SDU DEV_BORN
 declare -A METRIC_VAL METRIC_UNIT METRIC_SLOT METRIC_TS
 declare -A ALIAS_MAP
+declare -A EDGE_SEEN EDGE_LAST EDGE_MSGS EDGE_DEVICE
 declare -a DEV_ORDER=()
+declare -a EDGE_NODES=()
+declare -a EDGE_ORDER=()
+declare -a BROWSE_KEYS=()
+declare -a INVERTERS=()
+declare -a SDUS=()
 
-ARGS_HOST=""
+ARGS_HOST="10.0.0.3"
 ARGS_PORT=1883
 ARGS_GROUP=""
 ARGS_NODE=""
 ARGS_DEVICE=""
 ARGS_USERNAME=""
 ARGS_PASSWORD=""
-ARGS_CLIENT_ID="fluencetools-m10-hmi"
+ARGS_CLIENT_ID="nsdtools-fos-tui"
 ARGS_TOPIC="spBv1.0/#"
 ARGS_DEMO=0
 
 APP_CONNECTED=0
 APP_ERROR=""
+APP_STATUS=""
 APP_RUNNING=1
 APP_MODE="list"
 APP_SELECTED=""
+APP_SELECTED_EDGE=""
+APP_VIEW=""
+APP_KEY=""
 APP_CURSOR=0
 
 now_epoch() { date +%s; }
 now_epoch_ms() { date +%s%3N 2>/dev/null || echo $(( $(date +%s) * 1000 )); }
+
+# Sparkplug node names encode site structure:
+#   A_C001_N001_SDU    array A, core 1, node 1, Software Dispatch Unit
+#   A_C001_N001_DAC01  array A, core 1, node 1, DAC (PCS / inverter)
+#   A_C001_SDU         array A, core 1, SDU
+#   A_SDU / A_MDU / A  array-level
+# Globals: NN_ARRAY NN_CORE NN_NODE NN_ROLE NN_UNIT NN_KIND
+parse_node_name() {
+  local name="$1" t
+  NN_ARRAY=""; NN_CORE=""; NN_NODE=""; NN_ROLE=""; NN_UNIT=""; NN_KIND="other"
+  local IFS='_'
+  local -a tok=()
+  read -ra tok <<< "$name"
+  for t in "${tok[@]}"; do
+    if [[ "$t" =~ ^[A-Za-z]$ ]]; then
+      NN_ARRAY="${t^^}"
+    elif [[ "$t" =~ ^[Cc]0*([0-9]+)$ ]]; then
+      NN_CORE="${BASH_REMATCH[1]}"
+    elif [[ "$t" =~ ^[Nn]0*([0-9]+)$ ]]; then
+      NN_NODE="${BASH_REMATCH[1]}"
+    elif [[ "$t" =~ ^[Ss][Dd][Uu]$ ]]; then
+      NN_ROLE="SDU"; NN_UNIT="SDU"; NN_KIND="sdu"
+    elif [[ "$t" =~ ^[Dd][Aa][Cc]0*([0-9]+)$ ]]; then
+      NN_ROLE="DAC"; NN_UNIT="DAC${BASH_REMATCH[1]}"; NN_KIND="dac"
+    elif [[ "$t" =~ ^[Mm][Dd][Uu]$ ]]; then
+      NN_ROLE="MDU"; NN_UNIT="MDU"; NN_KIND="mdu"
+    elif [[ "$t" =~ ^[Oo][Cc][Tt][Ee]0*([0-9]+)$ ]]; then
+      NN_ROLE="OCTE"; NN_UNIT="OCTE${BASH_REMATCH[1]}"; NN_KIND="octe"
+    fi
+  done
+  if [[ -z "$NN_ROLE" && -n "$NN_ARRAY" && -z "$NN_CORE" && -z "$NN_NODE" ]]; then
+    NN_ROLE="ARRAY"; NN_UNIT="$NN_ARRAY"; NN_KIND="array"
+  fi
+  if [[ "$NN_KIND" == "sdu" ]]; then
+    if [[ -n "$NN_NODE" ]]; then
+      NN_KIND="nodesdu"
+    elif [[ -n "$NN_CORE" ]]; then
+      NN_KIND="coresdu"
+    else
+      NN_KIND="arraysdu"
+    fi
+  fi
+}
+
+role_label() {
+  case "${1:-}" in
+    dac) printf 'DAC/PCS' ;;
+    nodesdu) printf 'NODE SDU' ;;
+    coresdu) printf 'CORE SDU' ;;
+    arraysdu) printf 'ARRAY SDU' ;;
+    sdu) printf 'SDU' ;;
+    mdu) printf 'MDU' ;;
+    octe) printf 'OCTE' ;;
+    array) printf 'ARRAY' ;;
+    *) printf '%s' "${1:-—}" ;;
+  esac
+}
 
 norm_name() {
   local s="${1,,}"
@@ -137,6 +204,8 @@ ensure_device() {
     DEV_LAST[$key]=0
     DEV_SEQ[$key]=""
     DEV_IS_M10[$key]=0
+    DEV_IS_BMS[$key]=0
+    DEV_IS_SDU[$key]=0
     DEV_BORN[$key]=0
     DEV_ORDER+=("$key")
   fi
@@ -172,30 +241,28 @@ resolve_name() {
   printf ''
 }
 
-identify_m10() {
-  local key="$1"
-  local blob="${DEV_GROUP[$key]} ${DEV_NODE[$key]} ${DEV_DEVICE[$key]}"
-  local re='m[[:space:]_-]*10'
-  if [[ "${blob,,}" =~ $re ]]; then
-    return 0
-  fi
-  local mk name val
+metric_name_contains() {
+  local key="$1" needle="${2,,}" mk name
   for mk in "${!METRIC_VAL[@]}"; do
     [[ "$mk" == "$key|"* ]] || continue
     name="${mk#*|}"
-    val="${METRIC_VAL[$mk]}"
-    re='m[[:space:]_-]*10'
-    if [[ "${name,,}" =~ $re || "${val,,}" =~ $re ]]; then
-      return 0
-    fi
-    local hint='(device.?type|model|product|hw.?type|inverter.?type|manufacturer|vendor|devicetype)'
-    if [[ "${name,,}" =~ $hint ]]; then
-      if [[ "${val,,}" =~ $re ]]; then
-        return 0
-      fi
-    fi
+    [[ "${name,,}" == *"$needle"* ]] && return 0
   done
   return 1
+}
+
+identify_m10() {
+  # Inverters publish a metric whose name contains inverter01.
+  metric_name_contains "$1" "inverter01"
+}
+
+identify_bms() {
+  # BMS publishes a metric whose name contains BankBMS.
+  metric_name_contains "$1" "bankbms"
+}
+identify_sdu() {
+  # CoreSDU devices publish a metric whose name contains CoreSDU.
+  metric_name_contains "$1" "coresdu"
 }
 
 classify_device() {
@@ -205,19 +272,147 @@ classify_device() {
   else
     DEV_IS_M10[$key]=0
   fi
-  if [[ "$APP_MODE" == "detail" && -z "$APP_SELECTED" && -n "$ARGS_DEVICE" \
-        && "${DEV_IS_M10[$key]}" -eq 1 && "${DEV_DEVICE[$key]}" == "$ARGS_DEVICE" ]]; then
-    APP_SELECTED="$key"
+  if identify_bms "$key"; then
+    DEV_IS_BMS[$key]=1
+  else
+    DEV_IS_BMS[$key]=0
+  fi
+  if identify_sdu "$key"; then
+    DEV_IS_SDU[$key]=1
+  else
+    DEV_IS_SDU[$key]=0
+  fi
+  if [[ "$APP_MODE" == "detail" && -z "$APP_SELECTED" && -n "$ARGS_DEVICE" ]]; then
+    if [[ "${DEV_DEVICE[$key]}" == "$ARGS_DEVICE" || "${DEV_NODE[$key]}" == "$ARGS_DEVICE" ]]; then
+      APP_SELECTED="$key"
+    fi
   fi
 }
 
-# Populate INVERTERS array with M10 keys sorted by device/node
+heartbeat_name() {
+  local key="$1" mk name
+  for mk in "${!METRIC_VAL[@]}"; do
+    [[ "$mk" == "$key|"* ]] || continue
+    name="${mk#*|}"
+    if [[ "${name,,}" == *core_hb* ]]; then
+      printf '%s' "$name"
+      return 0
+    fi
+  done
+  printf ''
+  return 1
+}
+
+heartbeat_value() {
+  local key="$1" name
+  name="$(heartbeat_name "$key")" || true
+  if [[ -z "$name" ]]; then
+    printf ''
+    return 1
+  fi
+  printf '%s' "${METRIC_VAL[$(metric_key "$key" "$name")]:-}"
+}
+
+record_edge_node() {
+  local group="$1" node="$2" device="${3:-}" now="${4:-$(now_epoch)}"
+  [[ -n "$node" ]] || return 0
+  [[ "$group" == "STATE" ]] && return 0
+  local key="${group}/${node}"
+  if [[ -z "${EDGE_SEEN[$key]+x}" ]]; then
+    EDGE_ORDER+=("$key")
+  fi
+  EDGE_SEEN[$key]=1
+  EDGE_LAST[$key]="$now"
+  EDGE_MSGS[$key]=$(( ${EDGE_MSGS[$key]:-0} + 1 ))
+  if [[ -n "$device" && -z "${EDGE_DEVICE[$key]:-}" ]]; then
+    EDGE_DEVICE[$key]="$device"
+  fi
+}
+
+list_edge_nodes() {
+  EDGE_NODES=()
+  local key group node
+  local -a pairs=()
+  for key in "${!EDGE_SEEN[@]}"; do
+    group="${key%%/*}"
+    node="${key#*/}"
+    parse_node_name "$node"
+    pairs+=("$(printf '%s|%s|%05d|%05d|%s|%s' "${group,,}" "${NN_ARRAY:-}" "${NN_CORE:-0}" "${NN_NODE:-0}" "${NN_KIND}" "$key")")
+  done
+  if ((${#pairs[@]})); then
+    local sorted line
+    mapfile -t sorted < <(printf '%s\n' "${pairs[@]}" | sort)
+    for line in "${sorted[@]}"; do
+      EDGE_NODES+=("${line##*|}")
+    done
+  fi
+}
+
+dump_edge_nodes() {
+  list_edge_nodes
+  local key group node role
+  printf 'EDGE_NODES %d\n' "${#EDGE_NODES[@]}"
+  printf 'C=Core  N=Node  SDU=Software Dispatch Unit  DAC=PCS/inverter\n'
+  printf '%-12s %-6s %-6s %-6s %-8s %-24s %-8s %s\n' GROUP ARRAY CORE NODE ROLE NODE_NAME MSGS LAST
+  for key in "${EDGE_NODES[@]}"; do
+    group="${key%%/*}"
+    node="${key#*/}"
+    parse_node_name "$node"
+    role="$(role_label "$NN_KIND")"
+    printf '%-12s %-6s %-6s %-6s %-8s %-24s %-8s %s\n' \
+      "$group" "${NN_ARRAY:-—}" "${NN_CORE:-—}" "${NN_NODE:-—}" "$role" "$node" \
+      "${EDGE_MSGS[$key]:-0}" "${EDGE_LAST[$key]:-0}"
+  done
+}
+
+list_nodes() {
+  BROWSE_KEYS=("${EDGE_ORDER[@]}")
+}
+
+select_device_for_edge() {
+  local ekey="$1"
+  local group="${ekey%%/*}" node="${ekey#*/}"
+  local key best=""
+  parse_node_name "$node"
+  for key in "${DEV_ORDER[@]}"; do
+    [[ "${DEV_GROUP[$key]}" == "$group" && "${DEV_NODE[$key]}" == "$node" ]] || continue
+    if [[ "${DEV_IS_M10[$key]:-0}" -eq 1 ]]; then
+      printf '%s' "$key"
+      return 0
+    fi
+    if [[ "${DEV_IS_SDU[$key]:-0}" -eq 1 ]]; then
+      best="$key"
+      continue
+    fi
+    [[ -z "$best" ]] && best="$key"
+  done
+  printf '%s' "$best"
+}
+
+view_for_edge() {
+  local ekey="$1" dkey="${2:-}"
+  local node="${ekey#*/}"
+  parse_node_name "$node"
+  # Node-name tokens win for SDU/PCS routing (Enter from the list).
+  case "$NN_KIND" in
+    dac) printf 'm10'; return ;;
+    nodesdu) printf 'nodesdu'; return ;;
+    coresdu|arraysdu|sdu) printf 'coresdu'; return ;;
+  esac
+  if [[ -n "$dkey" && "${DEV_IS_M10[$dkey]:-0}" -eq 1 ]]; then printf 'm10'; return; fi
+  if [[ -n "$dkey" && "${DEV_IS_SDU[$dkey]:-0}" -eq 1 ]]; then printf 'coresdu'; return; fi
+  if [[ -n "$dkey" && "${DEV_IS_BMS[$dkey]:-0}" -eq 1 ]]; then printf 'generic'; return; fi
+  printf 'generic'
+}
+
+# Populate INVERTERS array with M10 keys sorted by device/node (BMS excluded)
 list_inverters() {
   INVERTERS=()
   local key name
   local -a pairs=()
   for key in "${DEV_ORDER[@]}"; do
     [[ "${DEV_IS_M10[$key]}" -eq 1 ]] || continue
+    [[ "${DEV_IS_BMS[$key]:-0}" -eq 1 ]] && continue
     name="${DEV_DEVICE[$key]:-${DEV_NODE[$key]}}"
     pairs+=("${name,,}|$key")
   done
@@ -230,15 +425,34 @@ list_inverters() {
   fi
 }
 
+list_sdus() {
+  SDUS=()
+  local key name
+  local -a pairs=()
+  for key in "${DEV_ORDER[@]}"; do
+    [[ "${DEV_IS_SDU[$key]:-0}" -eq 1 ]] || continue
+    name="${DEV_DEVICE[$key]:-${DEV_NODE[$key]}}"
+    parse_node_name "${DEV_NODE[$key]}"
+    pairs+=("$(printf '%s|%05d|%05d|%s|%s' "${NN_ARRAY:-}" "${NN_CORE:-0}" "${NN_NODE:-0}" "${name,,}" "$key")")
+  done
+  if ((${#pairs[@]})); then
+    local sorted line
+    mapfile -t sorted < <(printf '%s\n' "${pairs[@]}" | sort)
+    for line in "${sorted[@]}"; do
+      SDUS+=("${line##*|}")
+    done
+  fi
+}
+
 parse_args() {
-  ARGS_HOST="${M10_MQTT_HOST:-}"
-  ARGS_PORT="${M10_MQTT_PORT:-1883}"
-  ARGS_GROUP="${M10_SPARKPLUG_GROUP:-}"
-  ARGS_NODE="${M10_SPARKPLUG_NODE:-}"
-  ARGS_DEVICE="${M10_SPARKPLUG_DEVICE:-}"
-  ARGS_USERNAME="${M10_MQTT_USERNAME:-}"
-  ARGS_PASSWORD="${M10_MQTT_PASSWORD:-}"
-  ARGS_CLIENT_ID="${M10_MQTT_CLIENT_ID:-fluencetools-m10-hmi}"
+  ARGS_HOST="${FOS_TUI_MQTT_HOST:-${M10_MQTT_HOST:-${CORE_SDU_MQTT_HOST:-10.0.0.3}}}"
+  ARGS_PORT="${FOS_TUI_MQTT_PORT:-${M10_MQTT_PORT:-${CORE_SDU_MQTT_PORT:-1883}}}"
+  ARGS_GROUP="${FOS_TUI_SPARKPLUG_GROUP:-${M10_SPARKPLUG_GROUP:-${CORE_SDU_SPARKPLUG_GROUP:-}}}"
+  ARGS_NODE="${FOS_TUI_SPARKPLUG_NODE:-${M10_SPARKPLUG_NODE:-${CORE_SDU_SPARKPLUG_NODE:-}}}"
+  ARGS_DEVICE="${FOS_TUI_SPARKPLUG_DEVICE:-${M10_SPARKPLUG_DEVICE:-${CORE_SDU_SPARKPLUG_DEVICE:-}}}"
+  ARGS_USERNAME="${FOS_TUI_MQTT_USERNAME:-${M10_MQTT_USERNAME:-${CORE_SDU_MQTT_USERNAME:-}}}"
+  ARGS_PASSWORD="${FOS_TUI_MQTT_PASSWORD:-${M10_MQTT_PASSWORD:-${CORE_SDU_MQTT_PASSWORD:-}}}"
+  ARGS_CLIENT_ID="${FOS_TUI_MQTT_CLIENT_ID:-${M10_MQTT_CLIENT_ID:-nsdtools-fos-tui}}"
   ARGS_TOPIC="spBv1.0/#"
   ARGS_DEMO=0
 
@@ -256,13 +470,16 @@ parse_args() {
       --demo) ARGS_DEMO=1; shift ;;
       -h|--help)
         cat <<'HELP'
-Usage: epc-m10-hmi [--demo] [--host HOST] [--port PORT] [options]
+Usage: fos-tui [--demo] [--host HOST] [--port PORT] [options]
 
-Read-only terminal HMI for EPC M10 inverters (Sparkplug B over MQTT).
+Read-only Fluence OS terminal HMI (Sparkplug B over MQTT).
+Lists MQTT edge nodes as they publish. Enter opens the HMI for that
+device type (DAC/PCS → EPC M10, SDU → CoreSDU heartbeat).
+
 Subscribes only; never publishes.
 
-  --demo                 Simulate 3 M10s + 1 BMS (BMS filtered out)
-  --host HOST            MQTT broker (or M10_MQTT_HOST)
+  --demo                 Simulate mixed SDU / DAC / BMS fleet
+  --host HOST            MQTT broker (default 10.0.0.3, or FOS_TUI_MQTT_HOST)
   --port PORT            MQTT port (default 1883)
   --group/--node/--device Sparkplug filters
   --username/--password  MQTT auth

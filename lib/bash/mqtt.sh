@@ -6,6 +6,19 @@ MQTT_BUF_HEX=""
 MQTT_KEEPALIVE=30
 MQTT_LAST_PING=0
 MQTT_PACKET_ID=1
+MQTT_TCP_TIMEOUT=8
+MQTT_PUBLISH_COUNT=0
+MQTT_MAX_PACKETS_PER_DRAIN=12
+
+mqtt_note() {
+  APP_STATUS="$1"
+  if declare -F screen_draw >/dev/null 2>&1 && (( ${SCREEN_STARTED:-0} )); then
+    local now host
+    now=$(now_epoch)
+    host="${ARGS_HOST:-demo}"
+    screen_draw "$host" "$ARGS_PORT" "$APP_CONNECTED" "$APP_ERROR" "$ARGS_DEMO" "$now" "$APP_MODE" "$APP_SELECTED" "$APP_CURSOR"
+  fi
+}
 
 # Encode integer as MQTT remaining-length bytes (prints hex pairs)
 mqtt_rl_hex() {
@@ -33,22 +46,38 @@ mqtt_str_hex() {
 
 mqtt_write_hex() {
   local hex="$1"
+  [[ -n "${MQTT_FD:-}" ]] || return 1
   local i
   local cmd="printf '"
   for ((i=0; i<${#hex}; i+=2)); do
     cmd+="\\x${hex:i:2}"
   done
   cmd+="'"
-  eval "$cmd" >&"$MQTT_FD"
+  # Broker/SSH may close the socket; EPIPE must not abort under set -e.
+  eval "$cmd" >&"$MQTT_FD" 2>/dev/null || return 1
 }
 
 mqtt_connect() {
   local host="$1" port="$2" client_id="$3" username="$4" password="$5"
   MQTT_FD=""
   MQTT_BUF_HEX=""
+  APP_CONNECTED=0
+  APP_ERROR=""
 
+  mqtt_note "1/4 probing TCP ${host}:${port} (${MQTT_TCP_TIMEOUT}s)"
+  if command -v timeout >/dev/null 2>&1; then
+    if ! timeout "$MQTT_TCP_TIMEOUT" bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null; then
+      APP_ERROR="TCP timeout ${host}:${port} (${MQTT_TCP_TIMEOUT}s)"
+      mqtt_note "stuck: TCP ${host}:${port} did not accept"
+      APP_CONNECTED=0
+      return 1
+    fi
+  fi
+
+  mqtt_note "2/4 opening /dev/tcp/${host}/${port}"
   if ! exec {MQTT_FD}<>"/dev/tcp/${host}/${port}"; then
     APP_ERROR="cannot open /dev/tcp/${host}/${port}"
+    mqtt_note "stuck: /dev/tcp open failed"
     APP_CONNECTED=0
     return 1
   fi
@@ -74,26 +103,37 @@ mqtt_connect() {
   local body="${vh}${payload}"
   local blen=$((${#body} / 2))
   local packet="10$(mqtt_rl_hex "$blen")${body}"
+  mqtt_note "3/4 sending MQTT CONNECT (client ${client_id})"
   mqtt_write_hex "$packet" || {
     APP_ERROR="MQTT CONNECT write failed"
+    mqtt_note "stuck: CONNECT write failed"
     APP_CONNECTED=0
     return 1
   }
 
-  # Wait briefly for CONNACK
-  local deadline=$(( $(now_epoch) + 5 ))
+  local deadline=$(( $(now_epoch) + 5 )) left
   while (( $(now_epoch) < deadline )); do
+    (( APP_RUNNING )) || return 1
+    left=$(( deadline - $(now_epoch) ))
+    mqtt_note "3/4 waiting CONNACK (${left}s left)"
     mqtt_drain 0.2
+    if declare -F poll_keys >/dev/null 2>&1; then
+      poll_keys 0 || true
+    fi
     if [[ "$APP_CONNECTED" -eq 1 ]]; then
+      mqtt_note "4/4 SUBSCRIBE ${ARGS_TOPIC}"
       mqtt_subscribe "$ARGS_TOPIC"
       MQTT_LAST_PING=$(now_epoch)
+      mqtt_note "listening ${ARGS_TOPIC}"
       return 0
     fi
     if [[ -n "$APP_ERROR" && "$APP_ERROR" == MQTT* ]]; then
+      mqtt_note "stuck: ${APP_ERROR}"
       return 1
     fi
   done
   APP_ERROR="MQTT CONNACK timeout"
+  mqtt_note "stuck: no CONNACK from ${host}:${port}"
   return 1
 }
 
@@ -107,29 +147,47 @@ mqtt_subscribe() {
   body+="00"  # QoS 0
   local blen=$((${#body} / 2))
   local packet="82$(mqtt_rl_hex "$blen")${body}"
-  mqtt_write_hex "$packet"
+  mqtt_write_hex "$packet" || return 1
 }
 
 mqtt_ping() {
-  mqtt_write_hex "c000"
+  mqtt_write_hex "c000" || return 1
   MQTT_LAST_PING=$(now_epoch)
 }
 
 mqtt_disconnect() {
-  if [[ -n "$MQTT_FD" ]]; then
-    mqtt_write_hex "e000" 2>/dev/null || true
+  if [[ -n "${MQTT_FD:-}" ]]; then
+    mqtt_write_hex "e000" || true
     exec {MQTT_FD}>&- 2>/dev/null || true
     MQTT_FD=""
   fi
   APP_CONNECTED=0
 }
 
-# Read available bytes into MQTT_BUF_HEX (timeout seconds, float ok via timeout cmd)
+# Read available bytes into MQTT_BUF_HEX. Prefer non-blocking dd so the
+# UI loop is not stalled by timeout(1) + dd every frame.
 mqtt_read_some() {
-  local timeout="${1:-0.05}"
-  [[ -n "$MQTT_FD" ]] || return 1
+  local timeout="${1:-0}"
+  [[ -n "${MQTT_FD:-}" ]] || return 1
   local data
-  data=$(timeout "$timeout" dd bs=8192 count=1 status=none <&"$MQTT_FD" 2>/dev/null | bin_to_hex)
+  if [[ -z "${MQTT_HAS_NONBLOCK:-}" ]]; then
+    if dd iflag=nonblock count=0 status=none </dev/null >/dev/null 2>&1; then
+      MQTT_HAS_NONBLOCK=1
+    else
+      MQTT_HAS_NONBLOCK=0
+    fi
+  fi
+  if [[ "$timeout" == "0" || "$timeout" == "0.0" ]]; then
+    if (( MQTT_HAS_NONBLOCK )); then
+      data=$(dd bs=8192 count=1 iflag=nonblock status=none <&"$MQTT_FD" 2>/dev/null | bin_to_hex)
+    else
+      data=$(timeout 0.01 dd bs=8192 count=1 status=none <&"$MQTT_FD" 2>/dev/null | bin_to_hex)
+    fi
+  elif command -v timeout >/dev/null 2>&1; then
+    data=$(timeout "$timeout" dd bs=8192 count=1 status=none <&"$MQTT_FD" 2>/dev/null | bin_to_hex)
+  else
+    data=$(dd bs=8192 count=1 iflag=nonblock status=none <&"$MQTT_FD" 2>/dev/null | bin_to_hex)
+  fi
   if [[ -n "$data" ]]; then
     MQTT_BUF_HEX+="$data"
     return 0
@@ -161,9 +219,12 @@ mqtt_parse_rl() {
   done
 }
 
-# Process complete packets in buffer; invoke mqtt_on_publish for PUBLISH
+# Process complete packets in buffer; invoke mqtt_on_publish for PUBLISH.
+# Cap work so retained Sparkplug floods cannot starve key handling.
 mqtt_process_buffer() {
+  local n=0
   while (( ${#MQTT_BUF_HEX} >= 4 )); do  # at least type + 1 rl byte
+    (( APP_RUNNING )) || return 0
     local b0=$((16#${MQTT_BUF_HEX:0:2}))
     local ptype=$(( b0 >> 4 ))
     mqtt_parse_rl 1 || return 0
@@ -196,6 +257,10 @@ mqtt_process_buffer() {
       *)  # ignore others (never send PUBLISH ourselves)
         ;;
     esac
+    n=$((n + 1))
+    if (( n >= MQTT_MAX_PACKETS_PER_DRAIN )); then
+      return 0
+    fi
   done
 }
 
@@ -227,18 +292,22 @@ mqtt_handle_publish() {
   fi
   off=$((pos * 2))
   local payload_hex="${packet:off}"
+  MQTT_PUBLISH_COUNT=$((MQTT_PUBLISH_COUNT + 1))
   mqtt_on_publish "$topic" "$payload_hex"
 }
 
 mqtt_drain() {
-  local t="${1:-0.05}"
-  [[ -n "$MQTT_FD" ]] || return 0
+  local t="${1:-0}"
+  [[ -n "${MQTT_FD:-}" ]] || return 0
+  (( APP_RUNNING )) || return 0
+  mqtt_process_buffer
+  (( APP_RUNNING )) || return 0
   mqtt_read_some "$t" || true
   mqtt_process_buffer
   local now
   now=$(now_epoch)
   if (( APP_CONNECTED && now - MQTT_LAST_PING >= MQTT_KEEPALIVE - 5 )); then
-    mqtt_ping
+    mqtt_ping || true
   fi
 }
 

@@ -276,7 +276,7 @@ decode_payload_hex() {
   MD_NAME=(); MD_ALIAS=(); MD_TS=(); MD_DT=(); MD_NULL=(); MD_VALUE=()
 
   pb_reset "$raw"
-  local tag field wire blob
+  local tag field wire blob n=0
   while ! pb_eof; do
     tag=$(pb_varint) || break
     field=$((tag >> 3))
@@ -285,7 +285,10 @@ decode_payload_hex() {
       1:0) PL_TIMESTAMP=$(pb_varint) || break ;;
       2:2)
         blob=$(pb_bytes_hex) || break
-        decode_metric_hex "$blob"
+        if (( n < 48 )); then
+          decode_metric_hex "$blob"
+          n=$((n + 1))
+        fi
         ;;
       3:0) PL_SEQ=$(pb_varint) || break ;;
       4:2) PL_UUID=$(pb_string) || break ;;

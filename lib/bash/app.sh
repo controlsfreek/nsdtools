@@ -20,12 +20,25 @@ mqtt_on_publish() {
 
   local now
   now=$(now_epoch)
+  record_edge_node "$SP_GROUP" "$SP_NODE" "$SP_DEVICE" "$now"
   ensure_device "$SP_KEY" "$SP_GROUP" "$SP_NODE" "$SP_DEVICE"
 
   if [[ "$SP_KIND" == "death" ]]; then
     DEV_ONLINE[$SP_KEY]=0
     DEV_LAST[$SP_KEY]="$now"
     return 0
+  fi
+
+  # List view only needs the topic. Protobuf decode of retained NBIRTH
+  # floods is too slow in bash and blocks q / Ctrl-C.
+  if [[ "$APP_MODE" == "list" ]]; then
+    return 0
+  fi
+  if [[ -n "${APP_SELECTED_EDGE:-}" ]]; then
+    local ekey="${SP_GROUP}/${SP_NODE}"
+    if [[ "$ekey" != "$APP_SELECTED_EDGE" && "$SP_KEY" != "${APP_SELECTED:-}" ]]; then
+      return 0
+    fi
   fi
 
   decode_payload_hex "$payload_hex" || {
@@ -75,66 +88,75 @@ mqtt_on_publish() {
     upsert_metric "$SP_KEY" "$name" "$value" "$ts_use"
   done
 
-  if [[ "$SP_KIND" == "birth" || "${DEV_IS_M10[$SP_KEY]}" -eq 0 ]]; then
+  if [[ "$SP_KIND" == "birth" || "${DEV_IS_M10[$SP_KEY]:-0}" -eq 0 \
+        || "${DEV_IS_BMS[$SP_KEY]:-0}" -eq 0 || "${DEV_IS_SDU[$SP_KEY]:-0}" -eq 0 ]]; then
     classify_device "$SP_KEY"
   fi
 }
 
 open_cursor() {
-  list_inverters
-  ((${#INVERTERS[@]})) || return 0
+  list_nodes
+  ((${#BROWSE_KEYS[@]})) || return 0
   if (( APP_CURSOR < 0 )); then APP_CURSOR=0; fi
-  if (( APP_CURSOR >= ${#INVERTERS[@]} )); then APP_CURSOR=$((${#INVERTERS[@]} - 1)); fi
-  APP_SELECTED="${INVERTERS[$APP_CURSOR]}"
+  if (( APP_CURSOR >= ${#BROWSE_KEYS[@]} )); then APP_CURSOR=$((${#BROWSE_KEYS[@]} - 1)); fi
+  APP_SELECTED_EDGE="${BROWSE_KEYS[$APP_CURSOR]}"
+  APP_SELECTED="$(select_device_for_edge "$APP_SELECTED_EDGE")"
+  APP_VIEW="$(view_for_edge "$APP_SELECTED_EDGE" "$APP_SELECTED")"
   APP_MODE="detail"
 }
 
-# Read one key; maps arrows to j/k; bare Esc → esc. Drains CSI.
+# Read one key into APP_KEY (not stdout: $(…) strips Enter / trailing NL).
+# Maps arrows to j/k, CR/LF to enter, bare Esc → esc. Drains CSI.
 read_key() {
   local timeout="${1:-0.2}"
-  local ch
+  local ch="" more="" seq=""
+  APP_KEY=""
   if ! IFS= read -rsn1 -t "$timeout" ch; then
-    printf ''
     return 1
   fi
-  if [[ "$ch" != $'\033' ]]; then
-    printf '%s' "$ch"
+  ch="${ch:-}"
+  if [[ "$ch" == $'\r' || "$ch" == $'\n' ]]; then
+    APP_KEY="enter"
     return 0
   fi
-  # drain CSI / SS3
-  local seq="$ch" more
-  while IFS= read -rsn1 -t 0.08 more; do
-    seq+="$more"
+  if [[ "$ch" != $'\033' ]]; then
+    APP_KEY="$ch"
+    return 0
+  fi
+  # drain CSI / SS3 (short wait: arrows arrive immediately)
+  seq="$ch"
+  while IFS= read -rsn1 -t 0.01 more; do
+    seq+="${more:-}"
     # end of typical CSI
-    [[ "$more" =~ [A-Za-z~] ]] && break
+    [[ "${more:-}" =~ [A-Za-z~] ]] && break
   done
   if [[ "$seq" == $'\033' ]]; then
-    printf 'esc'
+    APP_KEY="esc"
     return 0
   fi
-  if [[ "$seq" == *$'\033'[A || "$seq" == *$'\033'OA || "$seq" == *A ]]; then
-    # prefer last char check
-    :
+  # [[ ]] not case: '[' in CSI would be a glob class in case patterns.
+  if [[ "$seq" == $'\033[A' || "$seq" == $'\033OA' ]]; then
+    APP_KEY="k"
+    return 0
   fi
-  case "$seq" in
-    $'\033'[A|$'\033'OA) printf 'k'; return 0 ;;
-    $'\033'[B|$'\033'OB) printf 'j'; return 0 ;;
-  esac
-  # ends with A/B
-  if [[ "$seq" == *A ]]; then printf 'k'; return 0; fi
-  if [[ "$seq" == *B ]]; then printf 'j'; return 0; fi
-  printf ''
-  return 1
+  if [[ "$seq" == $'\033[B' || "$seq" == $'\033OB' ]]; then
+    APP_KEY="j"
+    return 0
+  fi
+  return 0
 }
 
-poll_keys() {
-  local timeout="$1"
-  local ch
-  ch=$(read_key "$timeout") || return 0
+handle_key() {
+  local ch="${1:-}"
   [[ -z "$ch" ]] && return 0
   case "$ch" in
     esc)
-      [[ "$APP_MODE" == "detail" ]] && APP_MODE="list"
+      if [[ "$APP_MODE" == "detail" ]]; then
+        APP_MODE="list"
+        APP_VIEW=""
+        APP_SELECTED=""
+        APP_SELECTED_EDGE=""
+      fi
       return 0
       ;;
     q|Q|$'\003')
@@ -143,82 +165,121 @@ poll_keys() {
       ;;
   esac
   if [[ "$APP_MODE" == "list" ]]; then
-    list_inverters
+    list_nodes
     case "$ch" in
       j|J)
-        if ((${#INVERTERS[@]})); then
+        if ((${#BROWSE_KEYS[@]})); then
           APP_CURSOR=$((APP_CURSOR + 1))
-          (( APP_CURSOR >= ${#INVERTERS[@]} )) && APP_CURSOR=$((${#INVERTERS[@]} - 1))
+          if (( APP_CURSOR >= ${#BROWSE_KEYS[@]} )); then
+            APP_CURSOR=$((${#BROWSE_KEYS[@]} - 1))
+          fi
         fi
         ;;
       k|K)
         APP_CURSOR=$((APP_CURSOR - 1))
-        (( APP_CURSOR < 0 )) && APP_CURSOR=0
+        if (( APP_CURSOR < 0 )); then
+          APP_CURSOR=0
+        fi
         ;;
-      $'\r'|$'\n'|' ')
+      enter|$'\r'|$'\n'|' ')
         open_cursor
         ;;
     esac
   fi
+  return 0
+}
+
+poll_keys() {
+  local timeout="${1:-0}"
+  APP_KEY=""
+  read_key "$timeout" || true
+  handle_key "${APP_KEY:-}"
 }
 
 app_run() {
-  if (( ! ARGS_DEMO )) && [[ -z "$ARGS_HOST" ]]; then
-    echo "Need --host (or M10_MQTT_HOST), or pass --demo to preview the screen." >&2
-    return 2
-  fi
 
   screen_enter
-  local old_stty=""
+  OLD_STTY=""
   if [[ -t 0 ]]; then
-    old_stty=$(stty -g)
+    OLD_STTY=$(stty -g)
     stty cbreak -echo 2>/dev/null || stty -echo -icanon
   fi
 
-  trap 'APP_RUNNING=0' INT TERM
+  trap '' PIPE
+  trap 'APP_RUNNING=0; exit 130' INT
+  trap 'APP_RUNNING=0' TERM
+  trap 'mqtt_disconnect 2>/dev/null || true; [[ -n "${OLD_STTY:-}" ]] && stty "$OLD_STTY" 2>/dev/null || true; screen_leave || true' EXIT
+
+  local now host
+  host="${ARGS_HOST:-demo}"
+  now=$(now_epoch)
+  screen_draw "$host" "$ARGS_PORT" "$APP_CONNECTED" "$APP_ERROR" "$ARGS_DEMO" "$now" "$APP_MODE" "$APP_SELECTED" "$APP_CURSOR"
 
   if (( ! ARGS_DEMO )); then
     mqtt_connect "$ARGS_HOST" "$ARGS_PORT" "$ARGS_CLIENT_ID" "$ARGS_USERNAME" "$ARGS_PASSWORD" || true
   fi
 
-  local now host
-  host="${ARGS_HOST:-demo}"
+  local prev_draw=""
   while (( APP_RUNNING )); do
     now=$(now_epoch)
     if (( ARGS_DEMO )); then
       load_demo "$now"
       APP_CONNECTED=1
     else
-      mqtt_drain 0.05
+      mqtt_drain 0 || true
     fi
-    list_inverters
-    if [[ -n "$ARGS_DEVICE" && -z "$APP_SELECTED" ]]; then
-      local k
-      for k in "${INVERTERS[@]}"; do
-        if [[ "${DEV_DEVICE[$k]}" == "$ARGS_DEVICE" ]]; then
-          APP_SELECTED="$k"
+    (( APP_RUNNING )) || break
+    list_nodes
+    if [[ -n "$ARGS_DEVICE" && -z "$APP_SELECTED_EDGE" ]]; then
+      local k ekey
+      for ekey in "${BROWSE_KEYS[@]}"; do
+        if [[ "${ekey#*/}" == "$ARGS_DEVICE" ]]; then
+          APP_SELECTED_EDGE="$ekey"
+          APP_SELECTED="$(select_device_for_edge "$ekey")"
+          APP_VIEW="$(view_for_edge "$ekey" "$APP_SELECTED")"
           APP_MODE="detail"
           break
         fi
       done
+      if [[ -z "$APP_SELECTED_EDGE" ]]; then
+        for k in "${DEV_ORDER[@]}"; do
+          if [[ "${DEV_DEVICE[$k]}" == "$ARGS_DEVICE" || "${DEV_NODE[$k]}" == "$ARGS_DEVICE" ]]; then
+            APP_SELECTED="$k"
+            APP_SELECTED_EDGE="${DEV_GROUP[$k]}/${DEV_NODE[$k]}"
+            APP_VIEW="$(view_for_edge "$APP_SELECTED_EDGE" "$APP_SELECTED")"
+            APP_MODE="detail"
+            break
+          fi
+        done
+      fi
     fi
-    if ((${#INVERTERS[@]})); then
+    if [[ "$APP_MODE" == "detail" && -n "$APP_SELECTED_EDGE" ]]; then
+      APP_SELECTED="$(select_device_for_edge "$APP_SELECTED_EDGE")"
+      APP_VIEW="$(view_for_edge "$APP_SELECTED_EDGE" "$APP_SELECTED")"
+    fi
+    if ((${#BROWSE_KEYS[@]})); then
       if (( APP_CURSOR < 0 )); then APP_CURSOR=0; fi
-      if (( APP_CURSOR >= ${#INVERTERS[@]} )); then APP_CURSOR=$((${#INVERTERS[@]} - 1)); fi
+      if (( APP_CURSOR >= ${#BROWSE_KEYS[@]} )); then APP_CURSOR=$((${#BROWSE_KEYS[@]} - 1)); fi
     else
       APP_CURSOR=0
     fi
     local err=""
     (( ARGS_DEMO )) || err="$APP_ERROR"
-    screen_draw "$host" "$ARGS_PORT" "$APP_CONNECTED" "$err" "$ARGS_DEMO" "$now" "$APP_MODE" "$APP_SELECTED" "$APP_CURSOR"
-    poll_keys 0.2
+    local draw_key="${APP_MODE}|${APP_CURSOR}|${APP_SELECTED_EDGE}|${#BROWSE_KEYS[@]}|${MQTT_PUBLISH_COUNT:-0}|${APP_STATUS}|${err}|${now}"
+    if [[ "$draw_key" != "$prev_draw" ]]; then
+      screen_draw "$host" "$ARGS_PORT" "$APP_CONNECTED" "$err" "$ARGS_DEMO" "$now" "$APP_MODE" "$APP_SELECTED" "$APP_CURSOR"
+      prev_draw="$draw_key"
+    fi
+    # Idle wait is key input, not MQTT timeout(1).
+    poll_keys 0.05 || true
   done
 
   if (( ! ARGS_DEMO )); then
     mqtt_disconnect
   fi
-  if [[ -n "$old_stty" ]]; then
-    stty "$old_stty" 2>/dev/null || true
+  if [[ -n "$OLD_STTY" ]]; then
+    stty "$OLD_STTY" 2>/dev/null || true
+    OLD_STTY=""
   fi
   screen_leave
   return 0

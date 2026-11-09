@@ -1,0 +1,2 @@
+2026-01-10T09:00:00Z WARN MFR-0001 manufacturing deviation voltage oos actual=400 limit=380
+2026-01-10T09:00:01Z ERROR MFR-0001 out of spec actual=410 limit=380

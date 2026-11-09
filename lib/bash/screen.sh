@@ -7,26 +7,70 @@ TERM_ROWS=32
 
 screen_enter() {
   if (( ! SCREEN_STARTED )); then
-    printf '%s' "${ALT_ON}${HIDE}${CLEAR}"
+    # Home + per-line clear only. Avoid CSI 2J / 1049h: VS Code/plink
+    # often shows a blank buffer after a full clear or alt screen.
+    [[ -z "${TERM:-}" ]] && export TERM=xterm
+    printf '%s' "$HIDE" 2>/dev/null || true
     SCREEN_STARTED=1
   fi
 }
 
 screen_leave() {
   if (( SCREEN_STARTED )); then
-    printf '%s' "${ALT_OFF}${SHOW}${RESET}"
     SCREEN_STARTED=0
+    # stdout may already be gone (Ctrl-C, plink, SSH hangup)
+    printf '\n%s%s' "$SHOW" "$RESET" 2>/dev/null || true
   fi
 }
 
 screen_size() {
-  local c r
-  c=$(tput cols 2>/dev/null || echo 100)
-  r=$(tput lines 2>/dev/null || echo 32)
-  (( c < 72 )) && c=72
-  (( r < 24 )) && r=24
+  local c r sz
+  c="${COLUMNS:-}"
+  r="${LINES:-}"
+  if [[ -z "$c" || -z "$r" ]]; then
+    sz=$(stty size 2>/dev/null || true)
+    [[ -z "$r" ]] && r="${sz%% *}"
+    [[ -z "$c" ]] && c="${sz##* }"
+  fi
+  c="${c:-80}"
+  r="${r:-24}"
+  [[ "$c" =~ ^[0-9]+$ ]] || c=80
+  [[ "$r" =~ ^[0-9]+$ ]] || r=24
+  (( c < 40 )) && c=40
+  (( r < 8 )) && r=8
   TERM_COLS=$c
   TERM_ROWS=$r
+}
+
+# Redraw a fixed TERM_ROWS x TERM_COLS frame in place (no scroll).
+screen_emit() {
+  local -a body=("$@")
+  local cols=$TERM_COLS rows=$TERM_ROWS
+  local i ln
+  printf '%s' "$HOME_C$HIDE" 2>/dev/null || return 0
+  for ((i=0; i<rows; i++)); do
+    ln="${body[i]:-}"
+    printf '\r%s\033[K' "$(fit_text "$ln" "$cols")" 2>/dev/null || return 0
+    if (( i < rows - 1 )); then
+      printf '\n' 2>/dev/null || return 0
+    fi
+  done
+}
+
+screen_finish() {
+  local cols="$1"
+  local footer_help="$2"
+  shift 2
+  local -a lines=("$@")
+  local rows=$TERM_ROWS
+  local bar="${C_FRAME}$(printf '─%.0s' $(seq 1 "$cols"))${RESET}"
+  local limit=$((rows - 2))
+  (( limit < 1 )) && limit=1
+  local -a body=("${lines[@]:0:$limit}")
+  while ((${#body[@]} < limit)); do body+=(""); done
+  body+=("$bar")
+  body+=("$footer_help")
+  screen_emit "${body[@]}"
 }
 
 box_top() { printf '%s┌%s┐%s' "$C_FRAME" "$(printf '─%.0s' $(seq 1 $(($1-2))))" "$RESET"; }
@@ -49,9 +93,10 @@ screen_header() {
   else
     badge="${C_WARN}${BOLD} WAIT ${RESET}"
   fi
-  title="${C_TITLE}${BOLD}  EPC M10  ${RESET}${C_HEAD}INVERTER HMI${RESET}  ${C_MUTE}READ ONLY${RESET}"
+  title="${C_TITLE}${BOLD}  FOS  ${RESET}${C_HEAD}TUI${RESET}  ${C_MUTE}READ ONLY${RESET}"
   broker="${C_MUTE}mqtt://${host}:${port}${RESET}"
-  right="${broker}   ${badge}  ${C_VALUE}${clock}${RESET}"
+  pubs="${C_VALUE}${MQTT_PUBLISH_COUNT:-0}${RESET}${C_MUTE} pub${RESET}"
+  right="${broker}   ${pubs}   ${badge}  ${C_VALUE}${clock}${RESET}"
   spread_text "$title" "$right" "$cols"
 }
 
@@ -223,6 +268,20 @@ screen_draw() {
     screen_draw_list "$host" "$port" "$connected" "$error" "$demo" "$now" "$cursor" "$cols" "$rows"
     return
   fi
+  case "${APP_VIEW:-}" in
+    coresdu|sdu)
+      screen_draw_coresdu "$host" "$port" "$connected" "$error" "$demo" "$now" "$selected" "$cols" "$rows"
+      return
+      ;;
+    nodesdu)
+      screen_draw_nodesdu "$host" "$port" "$connected" "$error" "$demo" "$now" "$selected" "$cols" "$rows"
+      return
+      ;;
+    generic)
+      screen_draw_generic "$host" "$port" "$connected" "$error" "$demo" "$now" "$selected" "$cols" "$rows"
+      return
+      ;;
+  esac
 
   lines+=("$(screen_header "$cols" "$host" "$port" "$connected" "$error" "$demo")")
   local bar="${C_FRAME}$(printf '─%.0s' $(seq 1 "$cols"))${RESET}"
@@ -319,90 +378,204 @@ screen_draw() {
     done
   fi
 
-  local footer="${C_FRAME}$(printf '─%.0s' $(seq 1 "$cols"))${RESET}"$'\n'"${C_MUTE}  Esc list · q quit · tags from DBIRTH/DDATA · READ ONLY${RESET}"
-  local body_limit=$((rows - 2))
-  local -a body=("${lines[@]:0:$body_limit}")
-  while ((${#body[@]} < body_limit)); do body+=(""); done
-  local frame="${HOME_C}"
-  local ln
-  for ln in "${body[@]}"; do
-    frame+="$(fit_text "$ln" "$cols")"$'\n'
-  done
-  frame+="$footer${CLEAR_DOWN}"
-  printf '%s' "$frame"
+  screen_finish "$cols" "${C_MUTE}  Esc list · q quit · EPC M10 · tags from DBIRTH/DDATA · READ ONLY${RESET}" "${lines[@]}"
+}
+
+edge_health() {
+  local ekey="$1" now="$2"
+  local last="${EDGE_LAST[$ekey]:-0}"
+  local age=$(( now - last ))
+  if (( last <= 0 )); then
+    printf '%s' "${C_MUTE}WAIT${RESET}"
+  elif (( age > STALE_AFTER )); then
+    printf '%s' "${C_WARN}STALE ${age}s${RESET}"
+  else
+    printf '%s' "${C_OK}LIVE${RESET}"
+  fi
+}
+
+list_node_cell() {
+  local key="$1" now="$2" cursor="$3" idx="$4" width="$5"
+  local last age state sc mark name
+  last="${EDGE_LAST[$key]:-0}"
+  age=$(( now - last ))
+  if (( last <= 0 )); then
+    state="WAIT"; sc="$C_MUTE"
+  elif (( age > STALE_AFTER )); then
+    state="STALE"; sc="$C_WARN"
+  else
+    state="LIVE"; sc="$C_OK"
+  fi
+  if (( idx == cursor )); then mark="${C_AMBER}${BOLD}▶${RESET}"; else mark=" "; fi
+  name="${key#*/}"
+  parse_node_name "$name"
+  fit_text " ${mark} ${C_VALUE}${name}${RESET} ${C_LABEL}$(role_label "$NN_KIND")${RESET} ${sc}${state}${RESET}" "$width"
 }
 
 screen_draw_list() {
   local host="$1" port="$2" connected="$3" error="$4" demo="$5" now="$6" cursor="$7" cols="$8" rows="$9"
-  list_inverters
+  list_nodes
   local -a lines=()
   lines+=("$(screen_header "$cols" "$host" "$port" "$connected" "$error" "$demo")")
   lines+=("${C_FRAME}$(printf '─%.0s' $(seq 1 "$cols"))${RESET}")
 
-  local online=0 stale=0 off=0
+  local live=0 stale=0
   local key age last
-  for key in "${INVERTERS[@]}"; do
-    last="${DEV_LAST[$key]:-0}"
+  for key in "${BROWSE_KEYS[@]}"; do
+    last="${EDGE_LAST[$key]:-0}"
     age=$(( now - last ))
-    if [[ "${DEV_ONLINE[$key]}" -ne 1 ]]; then
-      off=$((off + 1))
-    elif (( last > 0 && age > STALE_AFTER )); then
+    if (( last > 0 && age > STALE_AFTER )); then
       stale=$((stale + 1))
     else
-      online=$((online + 1))
+      live=$((live + 1))
     fi
   done
-  lines+=("$(spread_text "${C_LABEL}  SELECT INVERTER${RESET}  ${C_MUTE}EPC M10 only · listening for DBIRTH${RESET}" "${C_OK}${online} online${RESET}  ${C_WARN}${stale} stale${RESET}  ${C_MUTE}${off} off${RESET}  ${C_VALUE}${#INVERTERS[@]} total${RESET}" "$cols")")
-  lines+=("")
+  lines+=("$(spread_text "${C_LABEL}  MQTT NODES${RESET}  ${C_MUTE}detection order · static${RESET}" "${C_OK}${live} live${RESET}  ${C_WARN}${stale} stale${RESET}  ${C_VALUE}${#BROWSE_KEYS[@]} total${RESET}" "$cols")")
 
-  local box_h=$(( rows - 8 ))
-  (( box_h < 6 )) && box_h=6
-  local inner_rows=$(( box_h - 3 ))
-  lines+=("$(box_top "$cols")")
-  lines+=("$(box_line "$cols" "  ${C_MUTE}$(printf '%-2s %-22s %-16s %-12s %-10s %s' '' DEVICE NODE GROUP STATE TAGS)${RESET}")")
-
-  if ((${#INVERTERS[@]} == 0)); then
-    local wait="  waiting for M10 birth messages …"
-    if (( ! connected && ! demo )); then wait="  connecting to broker …"; fi
-    lines+=("$(box_line "$cols" "${C_MUTE}${wait}${RESET}")")
-    local _
-    for ((_=1; _<inner_rows; _++)); do lines+=("$(box_line "$cols" "")"); done
-  else
-    local start=0
-    if (( cursor >= inner_rows )); then start=$(( cursor - inner_rows + 1 )); fi
-    local idx offset=0 name state sc mark row ntags
-    for ((idx=start; idx<${#INVERTERS[@]} && offset<inner_rows; idx++, offset++)); do
-      key="${INVERTERS[$idx]}"
-      last="${DEV_LAST[$key]:-0}"
-      age=$(( now - last ))
-      if [[ "${DEV_ONLINE[$key]}" -ne 1 ]]; then
-        state="OFFLINE"; sc="$C_BAD"
-      elif (( last > 0 && age > STALE_AFTER )); then
-        state="STALE ${age}s"; sc="$C_WARN"
-      else
-        state="ONLINE"; sc="$C_OK"
-      fi
-      if (( idx == cursor )); then mark="${C_AMBER}${BOLD}▶${RESET}"; else mark=" "; fi
-      name="${DEV_DEVICE[$key]:-${DEV_NODE[$key]}}"
-      ntags=$(count_metrics "$key")
-      row="  ${mark} ${C_VALUE}$(printf '%-22s' "$name")${RESET} ${C_LABEL}$(printf '%-16s' "${DEV_NODE[$key]}")${RESET} ${C_MUTE}$(printf '%-12s' "${DEV_GROUP[$key]}")${RESET} ${sc}$(printf '%-10s' "$state")${RESET} ${C_MUTE}${ntags}${RESET}"
-      lines+=("$(box_line "$cols" "$row")")
-    done
-    while (( offset < inner_rows )); do
-      lines+=("$(box_line "$cols" "")")
-      offset=$((offset + 1))
-    done
+  local header=3 footer=2 gap=2 min_cell=22
+  local inner=$(( rows - header - footer ))
+  (( inner < 1 )) && inner=1
+  local total=${#BROWSE_KEYS[@]}
+  local ncols=1 nrows=$inner
+  if (( total > 0 )); then
+    ncols=$(( (total + inner - 1) / inner ))
+    (( ncols < 1 )) && ncols=1
+    local max_cols=$(( (cols + gap) / (min_cell + gap) ))
+    (( max_cols < 1 )) && max_cols=1
+    (( ncols > max_cols )) && ncols=$max_cols
+    nrows=$(( (total + ncols - 1) / ncols ))
+    (( nrows > inner )) && nrows=$inner
   fi
-  lines+=("$(box_bot "$cols")")
+  local cell_w=$cols
+  if (( ncols > 1 )); then
+    cell_w=$(( (cols - gap * (ncols - 1)) / ncols ))
+  fi
+  (( cell_w < 8 )) && cell_w=8
+  local gsp=""
+  (( gap > 0 )) && gsp=$(printf '%*s' "$gap" '')
 
-  local footer="${C_FRAME}$(printf '─%.0s' $(seq 1 "$cols"))${RESET}"$'\n'"${C_MUTE}  ↑↓ / j k move · Enter open · Esc back · q quit · READ ONLY${RESET}"
-  local body_limit=$((rows - 2))
-  local -a body=("${lines[@]:0:$body_limit}")
-  while ((${#body[@]} < body_limit)); do body+=(""); done
-  local frame="${HOME_C}" ln
-  for ln in "${body[@]}"; do
-    frame+="$(fit_text "$ln" "$cols")"$'\n'
-  done
-  frame+="$footer${CLEAR_DOWN}"
-  printf '%s' "$frame"
+  if (( total == 0 )); then
+    local wait=""
+    if [[ -n "$error" ]]; then
+      wait="  ${error}"
+    elif [[ -n "${APP_STATUS:-}" ]]; then
+      wait="  ${APP_STATUS}"
+    elif (( ! connected && ! demo )); then
+      wait="  connecting to broker …"
+    else
+      wait="  waiting for Sparkplug publishes …"
+    fi
+    if [[ -n "$error" ]]; then
+      lines+=("${C_BAD}${wait}${RESET}")
+    else
+      lines+=("${C_MUTE}${wait}${RESET}")
+    fi
+  else
+    local r c idx out
+    for ((r=0; r<nrows; r++)); do
+      out=""
+      for ((c=0; c<ncols; c++)); do
+        idx=$(( c * nrows + r ))
+        if (( c > 0 )); then out+="$gsp"; fi
+        if (( idx < total )); then
+          out+="$(list_node_cell "${BROWSE_KEYS[$idx]}" "$now" "$cursor" "$idx" "$cell_w")"
+        else
+          out+="$(fit_text "" "$cell_w")"
+        fi
+      done
+      lines+=("$out")
+    done
+    if (( total > nrows * ncols )); then
+      lines[-1]="$(fit_text "${lines[-1]} ${C_MUTE}+$(( total - nrows * ncols )) more${RESET}" "$cols")"
+    fi
+  fi
+
+  screen_finish "$cols" "${C_MUTE}  ↑↓ / j k move · Enter open HMI · Esc back · q quit · READ ONLY${RESET}" "${lines[@]}"
+}
+
+print_simple_frame() {
+  local cols="$1"
+  shift
+  screen_finish "$cols" "${C_MUTE}  Esc list · q quit · READ ONLY${RESET}" "$@"
+}
+
+screen_draw_coresdu() {
+  local host="$1" port="$2" connected="$3" error="$4" demo="$5" now="$6" selected="$7" cols="$8" rows="$9"
+  local -a lines=()
+  lines+=("$(screen_header "$cols" "$host" "$port" "$connected" "$error" "$demo")")
+  lines+=("${C_FRAME}$(printf '─%.0s' $(seq 1 "$cols"))${RESET}")
+  local ekey="${APP_SELECTED_EDGE:-}"
+  local node="${ekey#*/}"
+  parse_node_name "$node"
+  local structure="array ${NN_ARRAY:-—} · core ${NN_CORE:-—} · $(role_label "$NN_KIND")"
+  if [[ -z "$selected" || -z "${DEV_GROUP[$selected]+x}" ]]; then
+    lines+=("${C_LABEL}  CORE SDU  ${RESET}${C_VALUE}${node:-—}${RESET}   ${C_MUTE}CoreSDU HMI${RESET}")
+    lines+=("${C_MUTE}  ${structure}${RESET}")
+    lines+=("${C_MUTE}  waiting for CoreSDU metrics …${RESET}")
+  else
+    local path health hb
+    path="${DEV_GROUP[$selected]} / ${DEV_NODE[$selected]}"
+    [[ -n "${DEV_DEVICE[$selected]}" ]] && path+=" / ${DEV_DEVICE[$selected]}"
+    health=$(device_health "$selected" "$now")
+    hb="$(heartbeat_value "$selected" || true)"
+    [[ -z "$hb" ]] && hb="—"
+    lines+=("$(spread_text "${C_LABEL}  CORE SDU  ${RESET}${C_VALUE}${path}${RESET}   ${health}" "${C_MUTE}Core_hb${RESET}" "$cols")")
+    lines+=("${C_MUTE}  ${structure}${RESET}")
+    lines+=("")
+    lines+=("$(box_top "$cols")")
+    lines+=("$(box_line "$cols" "  ${C_LABEL}heartbeat (Core_hb)${RESET}")")
+    lines+=("$(box_line "$cols" "  ${C_VALUE}$(fmt_value "$hb")${RESET}")")
+    lines+=("$(box_bot "$cols")")
+  fi
+  print_simple_frame "$cols" "${lines[@]}"
+}
+
+screen_draw_nodesdu() {
+  local host="$1" port="$2" connected="$3" error="$4" demo="$5" now="$6" selected="$7" cols="$8" rows="$9"
+  local -a lines=()
+  lines+=("$(screen_header "$cols" "$host" "$port" "$connected" "$error" "$demo")")
+  lines+=("${C_FRAME}$(printf '─%.0s' $(seq 1 "$cols"))${RESET}")
+  local ekey="${APP_SELECTED_EDGE:-}"
+  local node="${ekey#*/}"
+  parse_node_name "$node"
+  local structure="array ${NN_ARRAY:-—} · core ${NN_CORE:-—} · node ${NN_NODE:-—} · $(role_label "$NN_KIND")"
+  if [[ -z "$selected" || -z "${DEV_GROUP[$selected]+x}" ]]; then
+    lines+=("${C_LABEL}  NODE SDU  ${RESET}${C_VALUE}${node:-—}${RESET}   ${C_MUTE}NodeSDU HMI${RESET}")
+    lines+=("${C_MUTE}  ${structure}${RESET}")
+    lines+=("${C_MUTE}  waiting for NodeSDU metrics …${RESET}")
+  else
+    local path health ntags
+    path="${DEV_GROUP[$selected]} / ${DEV_NODE[$selected]}"
+    [[ -n "${DEV_DEVICE[$selected]}" ]] && path+=" / ${DEV_DEVICE[$selected]}"
+    health=$(device_health "$selected" "$now")
+    ntags=$(count_metrics "$selected")
+    lines+=("$(spread_text "${C_LABEL}  NODE SDU  ${RESET}${C_VALUE}${path}${RESET}   ${health}" "${C_MUTE}${ntags} tags${RESET}" "$cols")")
+    lines+=("${C_MUTE}  ${structure}${RESET}")
+    lines+=("")
+    lines+=("$(box_top "$cols")")
+    lines+=("$(box_line "$cols" "  ${C_LABEL}node${RESET}  ${C_VALUE}${NN_NODE:-—}${RESET}   ${C_LABEL}core${RESET}  ${C_VALUE}${NN_CORE:-—}${RESET}")")
+    lines+=("$(box_line "$cols" "  ${C_MUTE}NodeSDU panel · Esc returns to list${RESET}")")
+    lines+=("$(box_bot "$cols")")
+  fi
+  print_simple_frame "$cols" "${lines[@]}"
+}
+
+screen_draw_generic() {
+  local host="$1" port="$2" connected="$3" error="$4" demo="$5" now="$6" selected="$7" cols="$8" rows="$9"
+  local -a lines=()
+  lines+=("$(screen_header "$cols" "$host" "$port" "$connected" "$error" "$demo")")
+  lines+=("${C_FRAME}$(printf '─%.0s' $(seq 1 "$cols"))${RESET}")
+  local ekey="${APP_SELECTED_EDGE:-}"
+  local node="${ekey#*/}"
+  parse_node_name "$node"
+  local structure="array ${NN_ARRAY:-—} · core ${NN_CORE:-—} · node ${NN_NODE:-—} · $(role_label "$NN_KIND")"
+  lines+=("${C_LABEL}  NODE  ${RESET}${C_VALUE}${node:-—}${RESET}   ${C_MUTE}no type-specific HMI${RESET}")
+  lines+=("${C_MUTE}  ${structure}${RESET}")
+  if [[ -n "$selected" && -n "${DEV_GROUP[$selected]+x}" ]]; then
+    lines+=("$(spread_text "${C_LABEL}  DEVICE  ${RESET}${C_VALUE}${DEV_GROUP[$selected]} / ${DEV_NODE[$selected]} / ${DEV_DEVICE[$selected]:-}${RESET}" "$(device_health "$selected" "$now")" "$cols")")
+    lines+=("${C_MUTE}  tags $(count_metrics "$selected") · msgs ${EDGE_MSGS[$ekey]:-0}${RESET}")
+  else
+    lines+=("${C_MUTE}  msgs ${EDGE_MSGS[$ekey]:-0} · waiting for birth/data …${RESET}")
+  fi
+  print_simple_frame "$cols" "${lines[@]}"
 }

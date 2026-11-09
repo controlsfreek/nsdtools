@@ -1,0 +1,5 @@
+2026-01-10T08:00:00Z INFO start test
+2026-01-10T08:00:01Z ERROR MFR-0123 torque out of spec actual=12.5 limit=10.0
+2026-01-10T08:00:02Z FAIL MFR-0123 torque out of spec actual=13.0 limit=10.0
+2026-01-10T08:00:03Z INFO complete
+2026-01-10T08:00:04Z FAIL something weird happened with no code
