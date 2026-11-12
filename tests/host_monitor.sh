@@ -26,6 +26,15 @@ printf '2: eth0    inet 10.204.7.20/24 brd 10.204.7.255 scope global eth0\n'
 EOF
 chmod +x "$TEMP_DIR/bin/ip"
 
+missing_status=0
+PATH="$TEMP_DIR/bin:$PATH" "$ROOT_DIR/bin/fhm" \
+    -g "$TEMP_DIR/missing.conf" >"$TEMP_DIR/missing.out" 2>"$TEMP_DIR/missing.err" || missing_status=$?
+[[ $missing_status -eq 1 ]]
+[[ ! -s $TEMP_DIR/missing.out ]]
+grep -qF "No configuration files found at /etc/dhcp/dhcpd.conf or matching $TEMP_DIR/missing.conf" \
+    "$TEMP_DIR/missing.err"
+printf 'host monitor missing dhcp config passed\n'
+
 cat >"$TEMP_DIR/dhcp.conf" <<'EOF'
 host c1n1r1e1 { fixed-address 192.0.2.2; }
 host A_OCTE001 { fixed-address 192.0.2.1; }
