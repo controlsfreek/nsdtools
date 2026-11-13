@@ -33,11 +33,11 @@ PATH="$TEMP_DIR/bin:$PATH" "$ROOT_DIR/bin/fhm" \
 [[ ! -s $TEMP_DIR/missing.out ]]
 grep -qF "No configuration files found at /etc/dhcp/dhcpd.conf or matching $TEMP_DIR/missing.conf" \
     "$TEMP_DIR/missing.err"
-printf 'host monitor missing dhcp config passed\n'
+printf 'fhm missing dhcp config passed\n'
 
 cat >"$TEMP_DIR/dhcp.conf" <<'EOF'
-host c1n1r1e1 { fixed-address 192.0.2.2; }
-host A_OCTE001 { fixed-address 192.0.2.1; }
+host c1n1r1e1 { hardware ethernet aa:bb:cc:dd:ee:ff; fixed-address 192.0.2.2; }
+host A_OCTE001 { hardware ethernet 00:11:22:33:44:55; fixed-address 192.0.2.1; }
 host octe002 { fixed-address 192.0.2.3; }
 EOF
 
@@ -68,7 +68,7 @@ mixed_case_octe_line=$(grep -nF 'A_OCTE001' "$TEMP_DIR/output" | head -n 1 | cut
 [[ -n $octe_header_line && -n $octe_host_line && -n $mixed_case_octe_line ]]
 ((octe_header_line < octe_host_line))
 ((octe_header_line < mixed_case_octe_line))
-printf 'host monitor OCTE ordering passed\n'
+printf 'fhm OCTE ordering passed\n'
 
 core_line=$(grep -nF '[c1]' "$TEMP_DIR/output" | head -n 1 | cut -d: -f1)
 switch_line=$(grep -nF '10.204.7.134' "$TEMP_DIR/output" | head -n 1 | cut -d: -f1)
@@ -76,4 +76,38 @@ host_line=$(grep -nF 'c1n1r1e1' "$TEMP_DIR/output" | head -n 1 | cut -d: -f1)
 [[ -n $core_line && -n $switch_line && -n $host_line ]]
 ((core_line < switch_line))
 ((switch_line < host_line))
-printf 'host monitor core switch passed\n'
+if grep -qF 'aa:bb:cc:dd:ee:ff' "$TEMP_DIR/output"; then
+    printf 'MAC shown without -m\n' >&2
+    cat "$TEMP_DIR/output" >&2
+    exit 1
+fi
+printf 'fhm core switch passed\n'
+
+PATH="$TEMP_DIR/bin:$PATH" "$ROOT_DIR/bin/fhm" \
+    -m -i 10 -g "$TEMP_DIR/dhcp.conf" >"$TEMP_DIR/mac.out" 2>&1 &
+MONITOR_PID=$!
+
+for _ in {1..50}; do
+    if grep -qF 'aa:bb:cc:dd:ee:ff' "$TEMP_DIR/mac.out" && grep -qF '192.0.2.2' "$TEMP_DIR/mac.out"; then
+        break
+    fi
+    sleep 0.1
+done
+
+if ! grep -qF 'aa:bb:cc:dd:ee:ff' "$TEMP_DIR/mac.out" || ! grep -qF '192.0.2.2' "$TEMP_DIR/mac.out"; then
+    cat "$TEMP_DIR/mac.out" >&2
+    exit 1
+fi
+if ! grep -qF '00:11:22:33:44:55' "$TEMP_DIR/mac.out"; then
+    cat "$TEMP_DIR/mac.out" >&2
+    exit 1
+fi
+if ! grep -qE 'octe002[[:space:]].*192\.0\.2\.3[[:space:]]+-[[:space:]]' "$TEMP_DIR/mac.out"; then
+    cat "$TEMP_DIR/mac.out" >&2
+    exit 1
+fi
+
+kill "$MONITOR_PID" 2>/dev/null || true
+wait "$MONITOR_PID" 2>/dev/null || true
+MONITOR_PID=''
+printf 'fhm MAC display passed\n'

@@ -20,12 +20,13 @@ Needs `ssh` and `sshpass`.
 
 Each core also shows a core switch (`cN-core-switch`) directly under its core header. Its address uses the first three octets of the first local IPv4 address in `10.204.x.x` or `10.198.x.x`, with fourth octet `133 + N` (core 1 is `.134`, core 2 is `.135`). If no such local address exists, core switches are omitted.
 
-On a TTY it uses the alternate screen, colors UP green / DOWN red, and paginates when the list is taller than the terminal. The top banner shows the timestamp and the percentage of hosts that are UP (`UP 87% (174/200)`). Left/Right arrows change pages. Ctrl-C stops. Off a TTY it prints a snapshot each interval. If neither `dhcpd.conf` nor the config glob matches any file, it prints an error to stderr and exits 1 without starting the monitor loop.
+On a TTY it uses the alternate screen, colors UP green / DOWN red, and paginates when the list is taller than the terminal. The top banner shows the timestamp and the percentage of hosts that are UP (`UP 87% (174/200)`). Left/Right arrows change pages. Press `M` to show each host's DHCP `hardware ethernet` MAC next to the IP (press again to hide). `-m` starts with MACs visible. Ctrl-C stops. Off a TTY it prints a snapshot each interval. If neither `dhcpd.conf` nor the config glob matches any file, it prints an error to stderr and exits 1 without starting the monitor loop.
 
 ```bash
 ./bin/fhm
 ./bin/fhm -i 5 -t 1
 ./bin/fhm -g '/etc/dhcp/ansible*.conf'
+./bin/fhm -m
 ```
 
 Needs `ping` and `awk`.

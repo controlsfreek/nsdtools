@@ -7,10 +7,11 @@ INTERVAL=5
 TIMEOUT=1
 DHCPD_CONFIG='/etc/dhcp/dhcpd.conf'
 CONFIG_GLOB='/etc/dhcp/ansible*.conf'
+show_mac=0
 
 usage() {
     cat <<'EOF'
-Usage: fhm [-i seconds] [-t seconds] [-g config-glob]
+Usage: fhm [-i seconds] [-t seconds] [-g config-glob] [-m]
 
 Continuously displays the ping status of static hosts defined in dhcpd.conf and
 matching ISC DHCP configuration files. Each host block must contain a
@@ -21,6 +22,7 @@ Options:
   -t seconds      Timeout for each ping (default: 1)
     -g config-glob  Additional DHCP configuration file glob
                   (default: /etc/dhcp/ansible*.conf)
+  -m              Show MAC addresses next to IP addresses (toggle with M)
   -h              Show this help
 EOF
 }
@@ -29,11 +31,12 @@ is_positive_number() {
     [[ $1 =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v value="$1" 'BEGIN { exit !(value > 0) }'
 }
 
-while getopts ':i:t:g:h' option; do
+while getopts ':i:t:g:mh' option; do
     case "$option" in
         i) INTERVAL=$OPTARG ;;
         t) TIMEOUT=$OPTARG ;;
         g) CONFIG_GLOB=$OPTARG ;;
+        m) show_mac=1 ;;
         h) usage; exit 0 ;;
         :) printf 'Option -%s requires an argument.\n' "$OPTARG" >&2; exit 2 ;;
         \?) printf 'Unknown option: -%s\n' "$OPTARG" >&2; usage >&2; exit 2 ;;
@@ -74,11 +77,19 @@ read_hosts() {
             value = substr(block, RSTART, RLENGTH)
             sub(/^fixed-address[[:space:]]+/, "", value)
             sub(/;$/, "", value)
+            mac = "-"
+            if (match(block, /hardware[[:space:]]+ethernet[[:space:]]+[^;]+;/)) {
+                mac = substr(block, RSTART, RLENGTH)
+                sub(/^hardware[[:space:]]+ethernet[[:space:]]+/, "", mac)
+                sub(/;$/, "", mac)
+                gsub(/[[:space:]]+/, "", mac)
+                if (mac == "") mac = "-"
+            }
             hierarchy = name
             sub(/^[^c]*c/, "c", hierarchy)
             count = split(value, values, /[[:space:]]*,[[:space:]]*/)
             for (item_number = 1; item_number <= count; item_number++) {
-                print hierarchy "\t" name "\t" values[item_number]
+                print hierarchy "\t" name "\t" values[item_number] "\t" mac
             }
         }
 
@@ -122,10 +133,12 @@ switch_prefix=$(find_switch_prefix)
 
 declare -a host_names=()
 declare -a host_addresses=()
-while IFS=$'\t' read -r name address; do
+declare -a host_macs=()
+while IFS=$'\t' read -r name address mac; do
     [[ -n $name && -n $address ]] || continue
     host_names+=("$name")
     host_addresses+=("$address")
+    host_macs+=("${mac:--}")
 done < <(read_hosts "${config_files[@]}")
 
 if ((${#host_names[@]} == 0)); then
@@ -178,6 +191,7 @@ for index in "${!host_names[@]}"; do
             if [[ -n $switch_prefix ]]; then
                 host_names+=("${core}-core-switch")
                 host_addresses+=("$switch_prefix.$((133 + core_position))")
+                host_macs+=('-')
                 display_types+=('host')
                 display_labels+=('')
                 display_host_indexes+=("$((${#host_names[@]} - 1))")
@@ -249,21 +263,31 @@ wait_for_refresh_or_navigation() {
         return
     fi
 
-    if IFS= read -rsn1 -t "$INTERVAL" key && [[ $key == $'\e' ]]; then
-        IFS= read -rsn2 -t 0.1 sequence || true
-        case "$sequence" in
-            '[C')
-                if ((current_page + 1 < page_count)); then
-                    current_page=$((current_page + 1))
-                fi
-                ;;
-            '[D')
-                if ((current_page > 0)); then
-                    current_page=$((current_page - 1))
-                fi
-                ;;
-        esac
+    if ! IFS= read -rsn1 -t "$INTERVAL" key; then
+        return
     fi
+
+    case "$key" in
+        m|M)
+            show_mac=$((1 - show_mac))
+            skip_ping=1
+            ;;
+        $'\e')
+            IFS= read -rsn2 -t 0.1 sequence || true
+            case "$sequence" in
+                '[C')
+                    if ((current_page + 1 < page_count)); then
+                        current_page=$((current_page + 1))
+                    fi
+                    ;;
+                '[D')
+                    if ((current_page > 0)); then
+                        current_page=$((current_page - 1))
+                    fi
+                    ;;
+            esac
+            ;;
+    esac
 }
 
 if [[ -t 1 && ${TERM:-dumb} != dumb ]]; then
@@ -272,15 +296,19 @@ if [[ -t 1 && ${TERM:-dumb} != dumb ]]; then
 fi
 
 current_page=0
+skip_ping=0
 while true; do
-    pids=()
-    for index in "${!host_names[@]}"; do
-        ping_host "$index" &
-        pids+=("$!")
-    done
-    for pid in "${pids[@]}"; do
-        wait "$pid" || true
-    done
+    if ((skip_ping == 0)); then
+        pids=()
+        for index in "${!host_names[@]}"; do
+            ping_host "$index" &
+            pids+=("$!")
+        done
+        for pid in "${pids[@]}"; do
+            wait "$pid" || true
+        done
+    fi
+    skip_ping=0
 
     up_count=0
     for index in "${!host_names[@]}"; do
@@ -312,6 +340,7 @@ while true; do
     ((grid_rows > 0)) || grid_rows=1
 
     minimum_cell_width=46
+    ((show_mac)) && minimum_cell_width=64
     max_columns=$((layout_width / minimum_cell_width))
     ((max_columns > 0)) || max_columns=1
     needed_columns=$((${#display_types[@]} + grid_rows - 1))
@@ -372,7 +401,11 @@ while true; do
             IFS=$'\t' read -r status latency <"$result_dir/$index"
             latency_text=$latency
             [[ $latency == - ]] || latency_text="${latency}ms"
-            details="${host_addresses[index]}  $latency_text"
+            if ((show_mac)); then
+                details="${host_addresses[index]}  ${host_macs[index]}  $latency_text"
+            else
+                details="${host_addresses[index]}  $latency_text"
+            fi
 
             if ((interactive_output)) && [[ $status == UP ]]; then
                 printf '\033[32m%-*.*s\033[0m' "$host_width" "$host_width" "$host_display"
@@ -389,7 +422,7 @@ while true; do
         printf '\n'
     done
 
-    printf -v footer 'Refresh: %ss | Hosts: %d | Page: %d/%d | Left/Right: page | Ctrl-C: stop' \
+    printf -v footer 'Refresh: %ss | Hosts: %d | Page: %d/%d | Left/Right: page | M: MAC | Ctrl-C: stop' \
         "$INTERVAL" "${#host_names[@]}" "$((current_page + 1))" "$page_count"
     printf '\n%.*s' "$layout_width" "$footer"
     if ((interactive_output)); then
