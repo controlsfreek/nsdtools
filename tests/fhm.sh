@@ -37,6 +37,9 @@ printf 'fhm missing dhcp config passed\n'
 
 cat >"$TEMP_DIR/dhcp.conf" <<'EOF'
 host c1n1r1e1 { hardware ethernet aa:bb:cc:dd:ee:ff; fixed-address 192.0.2.2; }
+host c1n1r1e1sw { hardware ethernet 11:22:33:44:55:66; fixed-address 192.0.2.4; }
+host c1n1r1e2 { fixed-address 192.0.2.5; }
+host c1n1r1e2sw { fixed-address 192.0.2.6; }
 host A_OCTE001 { hardware ethernet 00:11:22:33:44:55; fixed-address 192.0.2.1; }
 host octe002 { fixed-address 192.0.2.3; }
 EOF
@@ -72,7 +75,7 @@ printf 'fhm OCTE ordering passed\n'
 
 core_line=$(grep -nF '[c1]' "$TEMP_DIR/output" | head -n 1 | cut -d: -f1)
 switch_line=$(grep -nF '10.204.7.134' "$TEMP_DIR/output" | head -n 1 | cut -d: -f1)
-host_line=$(grep -nF 'c1n1r1e1' "$TEMP_DIR/output" | head -n 1 | cut -d: -f1)
+host_line=$(grep -nE 'c1n1r1e1[[:space:]]' "$TEMP_DIR/output" | head -n 1 | cut -d: -f1)
 [[ -n $core_line && -n $switch_line && -n $host_line ]]
 ((core_line < switch_line))
 ((switch_line < host_line))
@@ -82,6 +85,21 @@ if grep -qF 'aa:bb:cc:dd:ee:ff' "$TEMP_DIR/output"; then
     exit 1
 fi
 printf 'fhm core switch passed\n'
+
+e1sw_line=$(grep -nE 'c1n1r1e1sw[[:space:]]' "$TEMP_DIR/output" | head -n 1 | cut -d: -f1)
+e1_line=$(grep -nE 'c1n1r1e1[[:space:]]' "$TEMP_DIR/output" | head -n 1 | cut -d: -f1)
+e2sw_line=$(grep -nE 'c1n1r1e2sw[[:space:]]' "$TEMP_DIR/output" | head -n 1 | cut -d: -f1)
+e2_line=$(grep -nE 'c1n1r1e2[[:space:]]' "$TEMP_DIR/output" | head -n 1 | cut -d: -f1)
+[[ -n $e1sw_line && -n $e1_line && -n $e2sw_line && -n $e2_line ]]
+((e1sw_line + 1 == e1_line))
+((e2sw_line + 1 == e2_line))
+((e1_line < e2sw_line))
+e1sw_row=$(sed -n "${e1sw_line}p" "$TEMP_DIR/output")
+e1_row=$(sed -n "${e1_line}p" "$TEMP_DIR/output")
+e1sw_indent=${e1sw_row%%[! ]*}
+e1_indent=${e1_row%%[! ]*}
+((${#e1_indent} == ${#e1sw_indent} + 1))
+printf 'fhm enclosure switch order passed\n'
 
 PATH="$TEMP_DIR/bin:$PATH" "$ROOT_DIR/bin/fhm" \
     -m -i 10 -g "$TEMP_DIR/dhcp.conf" >"$TEMP_DIR/mac.out" 2>&1 &
@@ -111,3 +129,51 @@ kill "$MONITOR_PID" 2>/dev/null || true
 wait "$MONITOR_PID" 2>/dev/null || true
 MONITOR_PID=''
 printf 'fhm MAC display passed\n'
+
+{
+    printf 'host A_OCTE001 { fixed-address 192.0.2.1; }\n'
+    for core in 1 2 3 4 5 6; do
+        for node in 1 2; do
+            for enclosure in 1 2 3 4; do
+                printf 'host c%sn%sr1e%s { fixed-address 10.0.%s.%s%s; }\n' \
+                    "$core" "$node" "$enclosure" "$core" "$node" "$enclosure"
+            done
+        done
+    done
+} >"$TEMP_DIR/pages.conf"
+
+PATH="$TEMP_DIR/bin:$PATH" \
+    FHM_TEST_ROWS=12 FHM_TEST_COLS=80 FHM_TEST_PAGE=2 \
+    "$ROOT_DIR/bin/fhm" -i 10 -g "$TEMP_DIR/pages.conf" >"$TEMP_DIR/page2.out" 2>&1 &
+MONITOR_PID=$!
+
+for _ in {1..50}; do
+    if grep -qE '\[c[0-9]+\]' "$TEMP_DIR/page2.out"; then
+        break
+    fi
+    sleep 0.1
+done
+
+kill "$MONITOR_PID" 2>/dev/null || true
+wait "$MONITOR_PID" 2>/dev/null || true
+MONITOR_PID=''
+
+if ! grep -qE '\[c[0-9]+\]' "$TEMP_DIR/page2.out"; then
+    cat "$TEMP_DIR/page2.out" >&2
+    exit 1
+fi
+
+grid_start=$(awk 'NR > 2 && $0 ~ /[^[:space:]]/ { print NR; exit }' "$TEMP_DIR/page2.out")
+[[ -n $grid_start ]]
+first_grid_line=$(sed -n "${grid_start}p" "$TEMP_DIR/page2.out")
+if [[ $first_grid_line != *\[c[0-9]*\]* ]]; then
+    printf 'page 2 did not start at a core header: %s\n' "$first_grid_line" >&2
+    cat "$TEMP_DIR/page2.out" >&2
+    exit 1
+fi
+if [[ $first_grid_line == *\[n[0-9]*\]* ]]; then
+    printf 'page 2 started with a node header: %s\n' "$first_grid_line" >&2
+    cat "$TEMP_DIR/page2.out" >&2
+    exit 1
+fi
+printf 'fhm page starts at core top passed\n'

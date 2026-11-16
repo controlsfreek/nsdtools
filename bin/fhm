@@ -118,6 +118,10 @@ is_octe_host() {
     [[ $1 =~ (^|[^[:alnum:]])[oO][cC][tT][eE][0-9]+([^[:alnum:]]|$) ]]
 }
 
+is_switch_host() {
+    [[ $1 =~ [sS][wW] ]]
+}
+
 # First three octets of the first local IPv4 address in 10.204.x.x or 10.198.x.x;
 # core switches live on that subnet at .134 (core 1), .135 (core 2), ...
 find_switch_prefix() {
@@ -150,29 +154,135 @@ declare -a display_types=()
 declare -a display_labels=()
 declare -a display_host_indexes=()
 declare -a display_indents=()
-octe_section_added=0
+declare -a host_is_octe=()
+declare -a host_is_switch=()
 for index in "${!host_names[@]}"; do
     if is_octe_host "${host_names[index]}"; then
-        if ((octe_section_added == 0)); then
-            display_types+=('header')
-            display_labels+=('[OCTE]')
-            display_host_indexes+=('-1')
-            display_indents+=('0')
-            octe_section_added=1
-        fi
-        display_types+=('host')
-        display_labels+=('')
-        display_host_indexes+=("$index")
-        display_indents+=('1')
+        host_is_octe[index]=1
+    else
+        host_is_octe[index]=0
+    fi
+    if is_switch_host "${host_names[index]}"; then
+        host_is_switch[index]=1
+    else
+        host_is_switch[index]=0
     fi
 done
-previous_core=''
-previous_node=''
-core_position=0
+octe_section_added=0
 for index in "${!host_names[@]}"; do
-    if is_octe_host "${host_names[index]}"; then
+    ((host_is_octe[index])) || continue
+    if ((octe_section_added == 0)); then
+        display_types+=('header')
+        display_labels+=('[OCTE]')
+        display_host_indexes+=('-1')
+        display_indents+=('0')
+        octe_section_added=1
+    fi
+    display_types+=('host')
+    display_labels+=('')
+    display_host_indexes+=("$index")
+    display_indents+=('1')
+done
+declare -A enclosure_switches=()
+declare -A enclosure_has_controller=()
+declare -a host_enclosure_id=()
+for index in "${!host_names[@]}"; do
+    ((host_is_octe[index])) && continue
+    if [[ ${host_names[index]} =~ c([0-9]+)n([0-9]+)r([0-9]+)e([0-9]+) ]]; then
+        host_enclosure_id[index]="c${BASH_REMATCH[1]}n${BASH_REMATCH[2]}r${BASH_REMATCH[3]}e${BASH_REMATCH[4]}"
+        if ((host_is_switch[index])); then
+            enclosure_switches[${host_enclosure_id[index]}]+="$index "
+        else
+            enclosure_has_controller[${host_enclosure_id[index]}]=1
+        fi
+    fi
+done
+declare -a display_order=()
+for index in "${!host_names[@]}"; do
+    ((host_is_octe[index])) && continue
+    eid=${host_enclosure_id[index]:-}
+    if [[ -n $eid ]] && ((host_is_switch[index])) && [[ -n ${enclosure_has_controller[$eid]:-} ]]; then
         continue
     fi
+    if [[ -n $eid ]] && ((host_is_switch[index] == 0)) && [[ -n ${enclosure_switches[$eid]:-} ]]; then
+        for switch_index in ${enclosure_switches[$eid]}; do
+            display_order+=("$switch_index")
+        done
+        enclosure_switches[$eid]=''
+    fi
+    display_order+=("$index")
+done
+previous_core=''
+core_position=0
+declare -A core_switch_index=()
+for index in "${display_order[@]}"; do
+    [[ ${host_names[index]} =~ c([0-9]+)n([0-9]+)r([0-9]+)(e([0-9]+))? ]] || continue
+    core="c${BASH_REMATCH[1]}"
+    if [[ $core != "$previous_core" ]]; then
+        previous_core=$core
+        core_position=$((core_position + 1))
+        if [[ -n $switch_prefix ]]; then
+            host_names+=("${core}-core-switch")
+            host_addresses+=("$switch_prefix.$((133 + core_position))")
+            host_macs+=('-')
+            core_switch_index[$core]=$((${#host_names[@]} - 1))
+        fi
+    fi
+done
+
+result_dir=$(mktemp -d)
+interactive_output=0
+declare -a ping_pids=()
+pings_in_flight=0
+cleanup() {
+    if ((${#ping_pids[@]} > 0)); then
+        kill "${ping_pids[@]}" 2>/dev/null || true
+        wait 2>/dev/null || true
+    fi
+    rm -rf -- "$result_dir"
+    if ((interactive_output)); then
+        printf '\033[?25h\033[?1049l'
+    fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+start_pings() {
+    local index
+    ping_pids=()
+    for index in "${!host_names[@]}"; do
+        command ping -n -c 1 -W "$TIMEOUT" "${host_addresses[index]}" >"$result_dir/$index.raw" 2>&1 &
+        ping_pids[index]=$!
+    done
+    pings_in_flight=1
+}
+
+collect_pings() {
+    local index output latency
+    ((pings_in_flight)) || return 0
+    for index in "${!ping_pids[@]}"; do
+        if wait "${ping_pids[index]}"; then
+            output=$(<"$result_dir/$index.raw")
+            latency=-
+            if [[ $output =~ time=([0-9]+([.][0-9]+)?) ]]; then
+                latency=${BASH_REMATCH[1]}
+            fi
+            printf 'UP\t%s\n' "$latency" >"$result_dir/$index"
+        else
+            printf 'DOWN\t-\n' >"$result_dir/$index"
+        fi
+        rm -f -- "$result_dir/$index.raw"
+    done
+    ping_pids=()
+    pings_in_flight=0
+}
+
+start_pings
+
+previous_core=''
+previous_node=''
+for index in "${display_order[@]}"; do
     host_indent=0
     if [[ ${host_names[index]} =~ c([0-9]+)n([0-9]+)r([0-9]+)(e([0-9]+))? ]]; then
         core="c${BASH_REMATCH[1]}"
@@ -187,14 +297,10 @@ for index in "${!host_names[@]}"; do
             display_indents+=('0')
             previous_core=$core
             previous_node=''
-            core_position=$((core_position + 1))
-            if [[ -n $switch_prefix ]]; then
-                host_names+=("${core}-core-switch")
-                host_addresses+=("$switch_prefix.$((133 + core_position))")
-                host_macs+=('-')
+            if [[ -n ${core_switch_index[$core]+x} ]]; then
                 display_types+=('host')
                 display_labels+=('')
-                display_host_indexes+=("$((${#host_names[@]} - 1))")
+                display_host_indexes+=("${core_switch_index[$core]}")
                 display_indents+=('1')
             fi
         fi
@@ -215,6 +321,9 @@ for index in "${!host_names[@]}"; do
         fi
         if [[ -n $equipment_value && ! $equipment_value =~ ^0+$ ]]; then
             ((host_indent++))
+            if ((host_is_switch[index] == 0)); then
+                ((host_indent++))
+            fi
         fi
     else
         if [[ $previous_core != Unclassified ]]; then
@@ -232,28 +341,6 @@ for index in "${!host_names[@]}"; do
     display_host_indexes+=("$index")
     display_indents+=("$host_indent")
 done
-
-result_dir=$(mktemp -d)
-interactive_output=0
-cleanup() {
-    rm -rf -- "$result_dir"
-    if ((interactive_output)); then
-        printf '\033[?25h\033[?1049l'
-    fi
-}
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-
-ping_host() {
-    local index=$1 output latency
-    if output=$(ping -n -c 1 -W "$TIMEOUT" "${host_addresses[index]}" 2>&1); then
-        latency=$(awk -F'time=' '/time=/{split($2, parts, " "); print parts[1]; exit}' <<<"$output")
-        printf 'UP\t%s\n' "${latency:--}" >"$result_dir/$index"
-    else
-        printf 'DOWN\t-\n' >"$result_dir/$index"
-    fi
-}
 
 wait_for_refresh_or_navigation() {
     local key='' sequence=''
@@ -290,23 +377,70 @@ wait_for_refresh_or_navigation() {
     esac
 }
 
+# Page 0 starts at the beginning of the list. Later pages start at a core
+# header ([cN]) rather than in the middle of a core. A core taller than one
+# page continues from the cut; OCTE/Unclassified use the same section rule.
+build_page_starts() {
+    local n=${#display_types[@]}
+    local start=0
+    local end=0
+    local section=0
+    local next=0
+    local i=0
+
+    page_starts=(0)
+    ((n > 0)) || return 0
+    ((page_capacity > 0)) || page_capacity=1
+
+    while true; do
+        end=$((start + page_capacity))
+        ((end < n)) || break
+
+        section=0
+        for ((i = end; i >= 0; i--)); do
+            if [[ ${display_types[i]} == header && ${display_indents[i]} == 0 ]]; then
+                section=$i
+                break
+            fi
+        done
+
+        if [[ ${display_labels[section]} =~ ^\[c[0-9]+\]$ ]] && ((section > start)); then
+            next=$section
+        elif [[ ${display_labels[section]} == '[OCTE]' ]]; then
+            next=$end
+            for ((i = section + 1; i < n; i++)); do
+                if [[ ${display_types[i]} == header && ${display_labels[i]} =~ ^\[c[0-9]+\]$ ]]; then
+                    next=$i
+                    break
+                fi
+            done
+            ((next > start)) || next=$end
+        elif ((section > start)); then
+            next=$section
+        else
+            next=$end
+        fi
+
+        ((next > start)) || break
+        page_starts+=("$next")
+        start=$next
+    done
+}
+
 if [[ -t 1 && ${TERM:-dumb} != dumb ]]; then
     interactive_output=1
     printf '\033[?1049h\033[?25l\033[2J\033[H'
 fi
 
 current_page=0
+if [[ ${FHM_TEST_PAGE:-} =~ ^[1-9][0-9]*$ ]]; then
+    current_page=$((FHM_TEST_PAGE - 1))
+fi
 skip_ping=0
 while true; do
     if ((skip_ping == 0)); then
-        pids=()
-        for index in "${!host_names[@]}"; do
-            ping_host "$index" &
-            pids+=("$!")
-        done
-        for pid in "${pids[@]}"; do
-            wait "$pid" || true
-        done
+        ((pings_in_flight)) || start_pings
+        collect_pings
     fi
     skip_ping=0
 
@@ -332,6 +466,12 @@ while true; do
         terminal_rows=$((${#display_types[@]} + 4))
         terminal_columns=80
     fi
+    if [[ ${FHM_TEST_ROWS:-} =~ ^[1-9][0-9]*$ ]]; then
+        terminal_rows=$FHM_TEST_ROWS
+    fi
+    if [[ ${FHM_TEST_COLS:-} =~ ^[1-9][0-9]*$ ]]; then
+        terminal_columns=$FHM_TEST_COLS
+    fi
 
     [[ $terminal_rows =~ ^[0-9]+$ ]] || terminal_rows=24
     [[ $terminal_columns =~ ^[0-9]+$ ]] || terminal_columns=80
@@ -353,10 +493,12 @@ while true; do
     fi
 
     page_capacity=$((grid_rows * column_count))
-    page_count=$((${#display_types[@]} + page_capacity - 1))
-    page_count=$((page_count / page_capacity))
+    declare -a page_starts=()
+    build_page_starts
+    page_count=${#page_starts[@]}
+    ((page_count > 0)) || page_count=1
     ((current_page < page_count)) || current_page=0
-    page_start=$((current_page * page_capacity))
+    page_start=${page_starts[current_page]:-0}
     page_item_count=$((${#display_types[@]} - page_start))
     ((page_item_count < page_capacity)) || page_item_count=$page_capacity
     page_rows=$((page_item_count + column_count - 1))
