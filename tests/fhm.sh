@@ -177,3 +177,67 @@ if [[ $first_grid_line == *\[n[0-9]*\]* ]]; then
     exit 1
 fi
 printf 'fhm page starts at core top passed\n'
+
+assert_first_grid_line_has_no_hosts() {
+    local output=$1
+    local label=$2
+    local grid_start first_grid_line
+    grid_start=$(awk 'NR > 2 && $0 ~ /[^[:space:]]/ { print NR; exit }' "$output")
+    [[ -n $grid_start ]]
+    first_grid_line=$(sed -n "${grid_start}p" "$output")
+    if [[ $first_grid_line =~ [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+        printf '%s first grid line included a host address: %s\n' "$label" "$first_grid_line" >&2
+        cat "$output" >&2
+        exit 1
+    fi
+    if [[ $first_grid_line == *octe002* || $first_grid_line == *A_OCTE* || $first_grid_line == *c[0-9]n* || $first_grid_line == *-core-switch* ]]; then
+        printf '%s first grid line included a host name: %s\n' "$label" "$first_grid_line" >&2
+        cat "$output" >&2
+        exit 1
+    fi
+}
+
+PATH="$TEMP_DIR/bin:$PATH" \
+    FHM_TEST_ROWS=12 FHM_TEST_COLS=120 \
+    "$ROOT_DIR/bin/fhm" -i 10 -g "$TEMP_DIR/dhcp.conf" >"$TEMP_DIR/wide.out" 2>&1 &
+MONITOR_PID=$!
+
+for _ in {1..50}; do
+    if grep -qF '[OCTE]' "$TEMP_DIR/wide.out"; then
+        break
+    fi
+    sleep 0.1
+done
+
+kill "$MONITOR_PID" 2>/dev/null || true
+wait "$MONITOR_PID" 2>/dev/null || true
+MONITOR_PID=''
+
+if ! grep -qF '[OCTE]' "$TEMP_DIR/wide.out"; then
+    cat "$TEMP_DIR/wide.out" >&2
+    exit 1
+fi
+assert_first_grid_line_has_no_hosts "$TEMP_DIR/wide.out" 'wide page 1'
+
+PATH="$TEMP_DIR/bin:$PATH" \
+    FHM_TEST_ROWS=12 FHM_TEST_COLS=120 FHM_TEST_PAGE=2 \
+    "$ROOT_DIR/bin/fhm" -i 10 -g "$TEMP_DIR/pages.conf" >"$TEMP_DIR/wide-page2.out" 2>&1 &
+MONITOR_PID=$!
+
+for _ in {1..50}; do
+    if grep -qE '\[c[0-9]+\]' "$TEMP_DIR/wide-page2.out"; then
+        break
+    fi
+    sleep 0.1
+done
+
+kill "$MONITOR_PID" 2>/dev/null || true
+wait "$MONITOR_PID" 2>/dev/null || true
+MONITOR_PID=''
+
+if ! grep -qE '\[c[0-9]+\]' "$TEMP_DIR/wide-page2.out"; then
+    cat "$TEMP_DIR/wide-page2.out" >&2
+    exit 1
+fi
+assert_first_grid_line_has_no_hosts "$TEMP_DIR/wide-page2.out" 'wide page 2'
+printf 'fhm first grid line has no hosts passed\n'

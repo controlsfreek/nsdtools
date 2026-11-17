@@ -377,6 +377,29 @@ wait_for_refresh_or_navigation() {
     esac
 }
 
+# Indent-0 section headers occupy the first grid row by themselves so a
+# multi-column page never puts host IPs/names on that line. Remaining items
+# fill the rows below. Continuation pages repeat the current section header.
+set_page_capacity() {
+    local start=$1
+    local body
+
+    if ((grid_rows <= 1)); then
+        page_capacity=$((grid_rows * column_count))
+        ((page_capacity > 0)) || page_capacity=1
+        return
+    fi
+
+    body=$(((grid_rows - 1) * column_count))
+    ((body > 0)) || body=1
+    if ((start < ${#display_types[@]})) &&
+        [[ ${display_types[start]} == header && ${display_indents[start]} == 0 ]]; then
+        page_capacity=$((1 + body))
+    else
+        page_capacity=$body
+    fi
+}
+
 # Page 0 starts at the beginning of the list. Later pages start at a core
 # header ([cN]) rather than in the middle of a core. A core taller than one
 # page continues from the cut; OCTE/Unclassified use the same section rule.
@@ -390,9 +413,9 @@ build_page_starts() {
 
     page_starts=(0)
     ((n > 0)) || return 0
-    ((page_capacity > 0)) || page_capacity=1
 
     while true; do
+        set_page_capacity "$start"
         end=$((start + page_capacity))
         ((end < n)) || break
 
@@ -492,21 +515,39 @@ while true; do
         column_count=$max_columns
     fi
 
-    page_capacity=$((grid_rows * column_count))
     declare -a page_starts=()
     build_page_starts
     page_count=${#page_starts[@]}
     ((page_count > 0)) || page_count=1
     ((current_page < page_count)) || current_page=0
     page_start=${page_starts[current_page]:-0}
+    set_page_capacity "$page_start"
     page_item_count=$((${#display_types[@]} - page_start))
     ((page_item_count < page_capacity)) || page_item_count=$page_capacity
-    page_rows=$((page_item_count + column_count - 1))
+    section_header=''
+    grid_index=$page_start
+    grid_count=$page_item_count
+    if ((grid_rows > 1 && page_item_count > 0)); then
+        if [[ ${display_types[page_start]} == header && ${display_indents[page_start]} == 0 ]]; then
+            section_header=${display_labels[page_start]}
+            grid_index=$((page_start + 1))
+            grid_count=$((page_item_count - 1))
+        else
+            for ((i = page_start; i >= 0; i--)); do
+                if [[ ${display_types[i]} == header && ${display_indents[i]} == 0 ]]; then
+                    section_header=${display_labels[i]}
+                    break
+                fi
+            done
+        fi
+    fi
+    ((grid_count > 0)) || grid_count=0
+    page_rows=$((grid_count + column_count - 1))
     page_rows=$((page_rows / column_count))
     cell_width=$((layout_width / column_count))
     separator_width=1
     host_width=1
-    for ((entry_index = page_start; entry_index < page_start + page_item_count; entry_index++)); do
+    for ((entry_index = grid_index; entry_index < grid_index + grid_count; entry_index++)); do
         [[ ${display_types[entry_index]} == host ]] || continue
         index=${display_host_indexes[entry_index]}
         candidate_width=$((${display_indents[entry_index]} + ${#host_names[index]}))
@@ -521,10 +562,18 @@ while true; do
         "$up_percent" "$up_count" "$host_total"
     printf '%.*s\n\n' "$layout_width" "$heading"
 
+    if [[ -n $section_header ]]; then
+        if ((interactive_output)); then
+            printf '\033[1;36m%-*.*s\033[0m\n' "$layout_width" "$layout_width" "$section_header"
+        else
+            printf '%-*.*s\n' "$layout_width" "$layout_width" "$section_header"
+        fi
+    fi
+
     for ((row = 0; row < page_rows; row++)); do
         for ((column = 0; column < column_count; column++)); do
-            entry_index=$((page_start + column * page_rows + row))
-            ((entry_index < page_start + page_item_count)) || continue
+            entry_index=$((grid_index + column * page_rows + row))
+            ((entry_index < grid_index + grid_count)) || continue
 
             if [[ ${display_types[entry_index]} == header ]]; then
                 printf -v indentation '%*s' "${display_indents[entry_index]}" ''
