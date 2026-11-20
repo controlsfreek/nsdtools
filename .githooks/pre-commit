@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Stamp bin/fhm BUILD from git commit count before each commit.
+set -euo pipefail
+
+root=$(git rev-parse --show-toplevel)
+"$root/lib/bash/stamp_fhm_build.sh" >/dev/null
+git add "$root/bin/fhm"

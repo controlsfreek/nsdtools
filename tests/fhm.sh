@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+expected_build=$("$ROOT_DIR/lib/bash/stamp_fhm_build.sh")
 TEMP_DIR=$(mktemp -d)
 MONITOR_PID=''
 cleanup() {
@@ -42,6 +43,10 @@ host c1n1r1e2 { fixed-address 192.0.2.5; }
 host c1n1r1e2sw { fixed-address 192.0.2.6; }
 host A_OCTE001 { hardware ethernet 00:11:22:33:44:55; fixed-address 192.0.2.1; }
 host octe002 { fixed-address 192.0.2.3; }
+host octe003 { fixed-address 10.8.8.1; }
+host A_UPS001 { hardware ethernet 22:33:44:55:66:77; fixed-address 192.0.2.10; }
+host ups003 { fixed-address 10.8.8.20; }
+host ups999 { fixed-address 10.9.9.1; }
 EOF
 
 PATH="$TEMP_DIR/bin:$PATH" "$ROOT_DIR/bin/fhm" \
@@ -49,13 +54,15 @@ PATH="$TEMP_DIR/bin:$PATH" "$ROOT_DIR/bin/fhm" \
 MONITOR_PID=$!
 
 for _ in {1..50}; do
-    if grep -qF 'A_OCTE001' "$TEMP_DIR/output" && grep -qF 'octe002' "$TEMP_DIR/output"; then
+    if grep -qF 'A_OCTE001' "$TEMP_DIR/output" && grep -qF 'octe002' "$TEMP_DIR/output" &&
+        grep -qF 'A_UPS001' "$TEMP_DIR/output" && grep -qF 'ups999' "$TEMP_DIR/output"; then
         break
     fi
     sleep 0.1
 done
 
-if ! grep -qF 'A_OCTE001' "$TEMP_DIR/output" || ! grep -qF 'octe002' "$TEMP_DIR/output"; then
+if ! grep -qF 'A_OCTE001' "$TEMP_DIR/output" || ! grep -qF 'octe002' "$TEMP_DIR/output" ||
+    ! grep -qF 'A_UPS001' "$TEMP_DIR/output" || ! grep -qF 'ups999' "$TEMP_DIR/output"; then
     cat "$TEMP_DIR/output" >&2
     exit 1
 fi
@@ -63,6 +70,13 @@ fi
 kill "$MONITOR_PID" 2>/dev/null || true
 wait "$MONITOR_PID" 2>/dev/null || true
 MONITOR_PID=''
+
+header_line=$(sed -n '1p' "$TEMP_DIR/output")
+commit_count=$(git -C "$ROOT_DIR" rev-list --count HEAD)
+[[ $expected_build -eq $((commit_count + 1)) ]]
+[[ $header_line == 'Fluence Host Monitor'* ]]
+[[ $header_line == *'build '"$expected_build"* ]]
+printf 'fhm header title and build passed\n'
 
 octe_header_line=$(grep -nF '[OCTE]' "$TEMP_DIR/output" | head -n 1 | cut -d: -f1)
 octe_host_line=$(grep -nF 'octe002' "$TEMP_DIR/output" | head -n 1 | cut -d: -f1)
@@ -72,6 +86,32 @@ mixed_case_octe_line=$(grep -nF 'A_OCTE001' "$TEMP_DIR/output" | head -n 1 | cut
 ((octe_header_line < octe_host_line))
 ((octe_header_line < mixed_case_octe_line))
 printf 'fhm OCTE ordering passed\n'
+
+octe001_line=$(grep -nE 'A_OCTE001[[:space:]]' "$TEMP_DIR/output" | head -n 1 | cut -d: -f1)
+ups001_line=$(grep -nE 'A_UPS001[[:space:]]' "$TEMP_DIR/output" | head -n 1 | cut -d: -f1)
+octe003_line=$(grep -nE 'octe003[[:space:]]' "$TEMP_DIR/output" | head -n 1 | cut -d: -f1)
+ups003_line=$(grep -nE 'ups003[[:space:]]' "$TEMP_DIR/output" | head -n 1 | cut -d: -f1)
+ups999_line=$(grep -nE 'ups999[[:space:]]' "$TEMP_DIR/output" | head -n 1 | cut -d: -f1)
+[[ -n $octe001_line && -n $ups001_line && -n $octe003_line && -n $ups003_line && -n $ups999_line ]]
+((octe001_line + 1 == ups001_line))
+((octe003_line + 1 == ups003_line))
+((ups001_line < octe_host_line))
+((ups003_line < ups999_line))
+if grep -qF '[UPS]' "$TEMP_DIR/output"; then
+    printf 'UPS section should be inside [OCTE]\n' >&2
+    cat "$TEMP_DIR/output" >&2
+    exit 1
+fi
+octe001_row=$(sed -n "${octe001_line}p" "$TEMP_DIR/output")
+ups001_row=$(sed -n "${ups001_line}p" "$TEMP_DIR/output")
+octe001_indent=${octe001_row%%[! ]*}
+ups001_indent=${ups001_row%%[! ]*}
+((${#ups001_indent} == ${#octe001_indent} + 1))
+core_after_ups=$(grep -nF '[c1]' "$TEMP_DIR/output" | head -n 1 | cut -d: -f1)
+[[ -n $core_after_ups ]]
+((octe_header_line < ups999_line))
+((ups999_line < core_after_ups))
+printf 'fhm UPS under matching OCTE passed\n'
 
 core_line=$(grep -nF '[c1]' "$TEMP_DIR/output" | head -n 1 | cut -d: -f1)
 switch_line=$(grep -nF '10.204.7.134' "$TEMP_DIR/output" | head -n 1 | cut -d: -f1)

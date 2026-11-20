@@ -7,6 +7,8 @@ INTERVAL=5
 TIMEOUT=1
 DHCPD_CONFIG='/etc/dhcp/dhcpd.conf'
 CONFIG_GLOB='/etc/dhcp/ansible*.conf'
+TITLE='Fluence Host Monitor'
+BUILD=10
 show_mac=0
 
 usage() {
@@ -118,8 +120,16 @@ is_octe_host() {
     [[ $1 =~ (^|[^[:alnum:]])[oO][cC][tT][eE][0-9]+([^[:alnum:]]|$) ]]
 }
 
+is_ups_host() {
+    [[ $1 =~ (^|[^[:alnum:]])[uU][pP][sS]([0-9]+)?([^[:alnum:]]|$) ]]
+}
+
 is_switch_host() {
     [[ $1 =~ [sS][wW] ]]
+}
+
+ipv4_prefix() {
+    [[ $1 =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.[0-9]+$ ]] && printf '%s\n' "${BASH_REMATCH[1]}"
 }
 
 # First three octets of the first local IPv4 address in 10.204.x.x or 10.198.x.x;
@@ -155,13 +165,21 @@ declare -a display_labels=()
 declare -a display_host_indexes=()
 declare -a display_indents=()
 declare -a host_is_octe=()
+declare -a host_is_ups=()
 declare -a host_is_switch=()
+declare -a host_ups_placed=()
 for index in "${!host_names[@]}"; do
     if is_octe_host "${host_names[index]}"; then
         host_is_octe[index]=1
+        host_is_ups[index]=0
+    elif is_ups_host "${host_names[index]}"; then
+        host_is_octe[index]=0
+        host_is_ups[index]=1
     else
         host_is_octe[index]=0
+        host_is_ups[index]=0
     fi
+    host_ups_placed[index]=0
     if is_switch_host "${host_names[index]}"; then
         host_is_switch[index]=1
     else
@@ -182,12 +200,50 @@ for index in "${!host_names[@]}"; do
     display_labels+=('')
     display_host_indexes+=("$index")
     display_indents+=('1')
+    octe_prefix=$(ipv4_prefix "${host_addresses[index]}")
+    [[ -n $octe_prefix ]] || continue
+    for ups_index in "${!host_names[@]}"; do
+        ((host_is_ups[ups_index])) || continue
+        ((host_ups_placed[ups_index])) && continue
+        ups_prefix=$(ipv4_prefix "${host_addresses[ups_index]}")
+        [[ $ups_prefix == "$octe_prefix" ]] || continue
+        display_types+=('host')
+        display_labels+=('')
+        display_host_indexes+=("$ups_index")
+        display_indents+=('2')
+        host_ups_placed[ups_index]=1
+    done
+done
+ups_section_added=0
+for index in "${!host_names[@]}"; do
+    ((host_is_ups[index])) || continue
+    ((host_ups_placed[index])) && continue
+    if ((octe_section_added)); then
+        display_types+=('host')
+        display_labels+=('')
+        display_host_indexes+=("$index")
+        display_indents+=('1')
+        host_ups_placed[index]=1
+        continue
+    fi
+    if ((ups_section_added == 0)); then
+        display_types+=('header')
+        display_labels+=('[UPS]')
+        display_host_indexes+=('-1')
+        display_indents+=('0')
+        ups_section_added=1
+    fi
+    display_types+=('host')
+    display_labels+=('')
+    display_host_indexes+=("$index")
+    display_indents+=('1')
+    host_ups_placed[index]=1
 done
 declare -A enclosure_switches=()
 declare -A enclosure_has_controller=()
 declare -a host_enclosure_id=()
 for index in "${!host_names[@]}"; do
-    ((host_is_octe[index])) && continue
+    ((host_is_octe[index] || host_is_ups[index])) && continue
     if [[ ${host_names[index]} =~ c([0-9]+)n([0-9]+)r([0-9]+)e([0-9]+) ]]; then
         host_enclosure_id[index]="c${BASH_REMATCH[1]}n${BASH_REMATCH[2]}r${BASH_REMATCH[3]}e${BASH_REMATCH[4]}"
         if ((host_is_switch[index])); then
@@ -199,7 +255,7 @@ for index in "${!host_names[@]}"; do
 done
 declare -a display_order=()
 for index in "${!host_names[@]}"; do
-    ((host_is_octe[index])) && continue
+    ((host_is_octe[index] || host_is_ups[index])) && continue
     eid=${host_enclosure_id[index]:-}
     if [[ -n $eid ]] && ((host_is_switch[index])) && [[ -n ${enclosure_has_controller[$eid]:-} ]]; then
         continue
@@ -558,8 +614,8 @@ while true; do
     ((host_width > 0)) || host_width=1
     detail_width=$((cell_width - host_width - separator_width))
 
-    printf -v heading 'Network host status  %(%Y-%m-%d %H:%M:%S)T  |  UP %d%% (%d/%d)' -1 \
-        "$up_percent" "$up_count" "$host_total"
+    printf -v heading '%s  build %s  %(%Y-%m-%d %H:%M:%S)T  |  UP %d%% (%d/%d)' \
+        "$TITLE" "$BUILD" -1 "$up_percent" "$up_count" "$host_total"
     printf '%.*s\n\n' "$layout_width" "$heading"
 
     if [[ -n $section_header ]]; then
