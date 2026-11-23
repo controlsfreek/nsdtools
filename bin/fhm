@@ -8,7 +8,7 @@ TIMEOUT=1
 DHCPD_CONFIG='/etc/dhcp/dhcpd.conf'
 CONFIG_GLOB='/etc/dhcp/ansible*.conf'
 TITLE='Fluence Host Monitor'
-BUILD=11
+BUILD=12
 show_mac=0
 collapse_down_cores=0
 
@@ -678,9 +678,14 @@ while true; do
     else
         column_count=1
     fi
-    page_rows=$((grid_count + column_count - 1))
-    page_rows=$((page_rows / column_count))
-    ((page_rows <= body_rows)) || page_rows=$body_rows
+    # Fill each column to body_rows before opening another column.
+    if ((column_count <= 1)); then
+        page_rows=$grid_count
+        ((page_rows > 0)) || page_rows=0
+        ((page_rows <= body_rows)) || page_rows=$body_rows
+    else
+        page_rows=$body_rows
+    fi
     cell_width=$((layout_width / column_count))
     separator_width=1
     host_width=1

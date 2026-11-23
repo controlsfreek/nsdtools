@@ -431,3 +431,56 @@ kill "$MONITOR_PID" 2>/dev/null || true
 wait "$MONITOR_PID" 2>/dev/null || true
 MONITOR_PID=''
 printf 'fhm collapse hides unpingable cores passed\n'
+
+cat >"$TEMP_DIR/bin/ping" <<'EOF'
+#!/usr/bin/env bash
+printf '64 bytes time=1.0 ms\n'
+EOF
+chmod +x "$TEMP_DIR/bin/ping"
+
+{
+    for enclosure in 1 2 3 4 5 6 7 8; do
+        printf 'host c1n1r1e%s { fixed-address 192.0.2.%s; }\n' "$enclosure" "$enclosure"
+    done
+} >"$TEMP_DIR/fill.conf"
+
+PATH="$TEMP_DIR/bin:$PATH" \
+    FHM_TEST_ROWS=12 FHM_TEST_COLS=140 \
+    "$ROOT_DIR/bin/fhm" -i 10 -g "$TEMP_DIR/fill.conf" >"$TEMP_DIR/fill.out" 2>&1 &
+MONITOR_PID=$!
+
+for _ in {1..50}; do
+    if grep -qF 'c1-core-switch' "$TEMP_DIR/fill.out" && grep -qE 'c1n1r1e8[[:space:]]' "$TEMP_DIR/fill.out"; then
+        break
+    fi
+    sleep 0.1
+done
+
+kill "$MONITOR_PID" 2>/dev/null || true
+wait "$MONITOR_PID" 2>/dev/null || true
+MONITOR_PID=''
+
+if ! grep -qF 'c1-core-switch' "$TEMP_DIR/fill.out" || ! grep -qE 'c1n1r1e8[[:space:]]' "$TEMP_DIR/fill.out"; then
+    cat "$TEMP_DIR/fill.out" >&2
+    exit 1
+fi
+
+c1_line=$(grep -nF '[c1]' "$TEMP_DIR/fill.out" | head -n 1 | cut -d: -f1)
+[[ -n $c1_line ]]
+first_body_line=$(sed -n "$((c1_line + 1))p" "$TEMP_DIR/fill.out")
+if [[ $first_body_line != *c1-core-switch* ]]; then
+    printf 'expected core switch on the first body row: %s\n' "$first_body_line" >&2
+    cat "$TEMP_DIR/fill.out" >&2
+    exit 1
+fi
+if [[ $first_body_line != *c1n1r1e6* ]]; then
+    printf 'column was not filled before adding another column: %s\n' "$first_body_line" >&2
+    cat "$TEMP_DIR/fill.out" >&2
+    exit 1
+fi
+if [[ $first_body_line == *c1n1r1e4* ]]; then
+    printf 'columns were height-balanced instead of filled: %s\n' "$first_body_line" >&2
+    cat "$TEMP_DIR/fill.out" >&2
+    exit 1
+fi
+printf 'fhm fills columns before adding more passed\n'
