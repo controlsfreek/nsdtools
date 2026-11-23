@@ -8,12 +8,13 @@ TIMEOUT=1
 DHCPD_CONFIG='/etc/dhcp/dhcpd.conf'
 CONFIG_GLOB='/etc/dhcp/ansible*.conf'
 TITLE='Fluence Host Monitor'
-BUILD=10
+BUILD=11
 show_mac=0
+collapse_down_cores=0
 
 usage() {
     cat <<'EOF'
-Usage: fhm [-i seconds] [-t seconds] [-g config-glob] [-m]
+Usage: fhm [-i seconds] [-t seconds] [-g config-glob] [-m] [-c]
 
 Continuously displays the ping status of static hosts defined in dhcpd.conf and
 matching ISC DHCP configuration files. Each host block must contain a
@@ -25,6 +26,7 @@ Options:
     -g config-glob  Additional DHCP configuration file glob
                   (default: /etc/dhcp/ansible*.conf)
   -m              Show MAC addresses next to IP addresses (toggle with M)
+  -c              Collapse cores whose core switch is not pingable (toggle with C)
   -h              Show this help
 EOF
 }
@@ -33,12 +35,13 @@ is_positive_number() {
     [[ $1 =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v value="$1" 'BEGIN { exit !(value > 0) }'
 }
 
-while getopts ':i:t:g:mh' option; do
+while getopts ':i:t:g:mch' option; do
     case "$option" in
         i) INTERVAL=$OPTARG ;;
         t) TIMEOUT=$OPTARG ;;
         g) CONFIG_GLOB=$OPTARG ;;
         m) show_mac=1 ;;
+        c) collapse_down_cores=1 ;;
         h) usage; exit 0 ;;
         :) printf 'Option -%s requires an argument.\n' "$OPTARG" >&2; exit 2 ;;
         \?) printf 'Unknown option: -%s\n' "$OPTARG" >&2; usage >&2; exit 2 ;;
@@ -398,6 +401,56 @@ for index in "${display_order[@]}"; do
     display_indents+=("$host_indent")
 done
 
+full_types=("${display_types[@]}")
+full_labels=("${display_labels[@]}")
+full_host_indexes=("${display_host_indexes[@]}")
+full_indents=("${display_indents[@]}")
+
+apply_core_collapse() {
+    local i current_core idx status
+    declare -A collapsed_cores=()
+
+    if ((collapse_down_cores)) && ((${#core_switch_index[@]} > 0)); then
+        for current_core in "${!core_switch_index[@]}"; do
+            idx=${core_switch_index[$current_core]}
+            if [[ -f $result_dir/$idx ]]; then
+                IFS=$'\t' read -r status _ <"$result_dir/$idx"
+                if [[ $status != UP ]]; then
+                    collapsed_cores[$current_core]=1
+                fi
+            fi
+        done
+    fi
+
+    display_types=()
+    display_labels=()
+    display_host_indexes=()
+    display_indents=()
+    current_core=''
+    for i in "${!full_types[@]}"; do
+        if [[ ${full_types[i]} == header && ${full_indents[i]} == 0 ]]; then
+            if [[ ${full_labels[i]} =~ ^\[(c[0-9]+)\]$ ]]; then
+                current_core=${BASH_REMATCH[1]}
+            else
+                current_core=''
+            fi
+        fi
+        if ((collapse_down_cores)) && [[ -n $current_core && -n ${collapsed_cores[$current_core]:-} ]]; then
+            if [[ ${full_types[i]} == header && ${full_indents[i]} == 0 ]]; then
+                true
+            elif [[ ${full_types[i]} == host && ${host_names[${full_host_indexes[i]}]} == "$current_core-core-switch" ]]; then
+                true
+            else
+                continue
+            fi
+        fi
+        display_types+=("${full_types[i]}")
+        display_labels+=("${full_labels[i]}")
+        display_host_indexes+=("${full_host_indexes[i]}")
+        display_indents+=("${full_indents[i]}")
+    done
+}
+
 wait_for_refresh_or_navigation() {
     local key='' sequence=''
 
@@ -413,6 +466,10 @@ wait_for_refresh_or_navigation() {
     case "$key" in
         m|M)
             show_mac=$((1 - show_mac))
+            skip_ping=1
+            ;;
+        c|C)
+            collapse_down_cores=$((1 - collapse_down_cores))
             skip_ping=1
             ;;
         $'\e')
@@ -522,6 +579,7 @@ while true; do
         collect_pings
     fi
     skip_ping=0
+    apply_core_collapse
 
     up_count=0
     for index in "${!host_names[@]}"; do
@@ -578,8 +636,13 @@ while true; do
     ((current_page < page_count)) || current_page=0
     page_start=${page_starts[current_page]:-0}
     set_page_capacity "$page_start"
-    page_item_count=$((${#display_types[@]} - page_start))
-    ((page_item_count < page_capacity)) || page_item_count=$page_capacity
+    if ((current_page + 1 < page_count)); then
+        page_item_count=$((page_starts[current_page + 1] - page_start))
+    else
+        page_item_count=$((${#display_types[@]} - page_start))
+    fi
+    ((page_item_count > 0)) || page_item_count=0
+    ((page_item_count <= page_capacity)) || page_item_count=$page_capacity
     section_header=''
     grid_index=$page_start
     grid_count=$page_item_count
@@ -598,8 +661,26 @@ while true; do
         fi
     fi
     ((grid_count > 0)) || grid_count=0
+    body_rows=$grid_rows
+    if [[ -n $section_header ]]; then
+        body_rows=$((grid_rows - 1))
+    fi
+    ((body_rows > 0)) || body_rows=1
+    if ((grid_count > 0)); then
+        needed_columns=$((grid_count + body_rows - 1))
+        needed_columns=$((needed_columns / body_rows))
+        ((needed_columns > 0)) || needed_columns=1
+        if ((needed_columns < max_columns)); then
+            column_count=$needed_columns
+        else
+            column_count=$max_columns
+        fi
+    else
+        column_count=1
+    fi
     page_rows=$((grid_count + column_count - 1))
     page_rows=$((page_rows / column_count))
+    ((page_rows <= body_rows)) || page_rows=$body_rows
     cell_width=$((layout_width / column_count))
     separator_width=1
     host_width=1
@@ -629,7 +710,10 @@ while true; do
     for ((row = 0; row < page_rows; row++)); do
         for ((column = 0; column < column_count; column++)); do
             entry_index=$((grid_index + column * page_rows + row))
-            ((entry_index < grid_index + grid_count)) || continue
+            if ((entry_index >= grid_index + grid_count)); then
+                printf '%*s' "$cell_width" ''
+                continue
+            fi
 
             if [[ ${display_types[entry_index]} == header ]]; then
                 printf -v indentation '%*s' "${display_indents[entry_index]}" ''
@@ -669,7 +753,7 @@ while true; do
         printf '\n'
     done
 
-    printf -v footer 'Refresh: %ss | Hosts: %d | Page: %d/%d | Left/Right: page | M: MAC | Ctrl-C: stop' \
+    printf -v footer 'Refresh: %ss | Hosts: %d | Page: %d/%d | Left/Right: page | M: MAC | C: collapse | Ctrl-C: stop' \
         "$INTERVAL" "${#host_names[@]}" "$((current_page + 1))" "$page_count"
     printf '\n%.*s' "$layout_width" "$footer"
     if ((interactive_output)); then

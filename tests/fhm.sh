@@ -281,3 +281,153 @@ if ! grep -qE '\[c[0-9]+\]' "$TEMP_DIR/wide-page2.out"; then
 fi
 assert_first_grid_line_has_no_hosts "$TEMP_DIR/wide-page2.out" 'wide page 2'
 printf 'fhm first grid line has no hosts passed\n'
+
+PATH="$TEMP_DIR/bin:$PATH" \
+    FHM_TEST_ROWS=12 FHM_TEST_COLS=140 \
+    "$ROOT_DIR/bin/fhm" -i 10 -g "$TEMP_DIR/pages.conf" >"$TEMP_DIR/span.out" 2>&1 &
+MONITOR_PID=$!
+
+for _ in {1..50}; do
+    if grep -qF '[c1]' "$TEMP_DIR/span.out"; then
+        break
+    fi
+    sleep 0.1
+done
+
+kill "$MONITOR_PID" 2>/dev/null || true
+wait "$MONITOR_PID" 2>/dev/null || true
+MONITOR_PID=''
+
+if ! grep -qF '[c1]' "$TEMP_DIR/span.out" || ! grep -qE 'c1n1r1e1[[:space:]]' "$TEMP_DIR/span.out"; then
+    cat "$TEMP_DIR/span.out" >&2
+    exit 1
+fi
+if grep -qF '[c2]' "$TEMP_DIR/span.out" || grep -qF 'c2-core-switch' "$TEMP_DIR/span.out" ||
+    grep -qE 'c2n1r1e1[[:space:]]' "$TEMP_DIR/span.out"; then
+    printf 'page 1 leaked the next core onto the bottom of the columns\n' >&2
+    cat "$TEMP_DIR/span.out" >&2
+    exit 1
+fi
+printf 'fhm page does not leak next core passed\n'
+
+PATH="$TEMP_DIR/bin:$PATH" \
+    FHM_TEST_ROWS=12 FHM_TEST_COLS=140 FHM_TEST_PAGE=2 \
+    "$ROOT_DIR/bin/fhm" -i 10 -g "$TEMP_DIR/pages.conf" >"$TEMP_DIR/span2.out" 2>&1 &
+MONITOR_PID=$!
+
+for _ in {1..50}; do
+    if grep -qF '[c2]' "$TEMP_DIR/span2.out"; then
+        break
+    fi
+    sleep 0.1
+done
+
+kill "$MONITOR_PID" 2>/dev/null || true
+wait "$MONITOR_PID" 2>/dev/null || true
+MONITOR_PID=''
+
+if ! grep -qF '[c2]' "$TEMP_DIR/span2.out" || ! grep -qF 'c2-core-switch' "$TEMP_DIR/span2.out"; then
+    cat "$TEMP_DIR/span2.out" >&2
+    exit 1
+fi
+if grep -qE 'c1n1r1e1[[:space:]]' "$TEMP_DIR/span2.out"; then
+    printf 'page 2 included the previous core\n' >&2
+    cat "$TEMP_DIR/span2.out" >&2
+    exit 1
+fi
+printf 'fhm next page starts at snapped core passed\n'
+
+PATH="$TEMP_DIR/bin:$PATH" "$ROOT_DIR/bin/fhm" \
+    -c -i 10 -g "$TEMP_DIR/dhcp.conf" >"$TEMP_DIR/collapse-up.out" 2>&1 &
+MONITOR_PID=$!
+
+for _ in {1..50}; do
+    if grep -qE 'c1n1r1e1[[:space:]]' "$TEMP_DIR/collapse-up.out"; then
+        break
+    fi
+    sleep 0.1
+done
+
+if ! grep -qE 'c1n1r1e1[[:space:]]' "$TEMP_DIR/collapse-up.out"; then
+    cat "$TEMP_DIR/collapse-up.out" >&2
+    exit 1
+fi
+
+kill "$MONITOR_PID" 2>/dev/null || true
+wait "$MONITOR_PID" 2>/dev/null || true
+MONITOR_PID=''
+printf 'fhm collapse keeps pingable cores passed\n'
+
+cat >"$TEMP_DIR/bin/ping" <<'EOF'
+#!/usr/bin/env bash
+addr=${!#}
+if [[ $addr == 10.204.7.134 ]]; then
+    printf '100%% packet loss\n'
+    exit 1
+fi
+printf '64 bytes time=1.0 ms\n'
+EOF
+chmod +x "$TEMP_DIR/bin/ping"
+
+cat >"$TEMP_DIR/collapse.conf" <<'EOF'
+host c1n1r1e1 { hardware ethernet aa:bb:cc:dd:ee:ff; fixed-address 192.0.2.2; }
+host c1n1r1e1sw { hardware ethernet 11:22:33:44:55:66; fixed-address 192.0.2.4; }
+host c2n1r1e1 { fixed-address 192.0.2.20; }
+host A_OCTE001 { hardware ethernet 00:11:22:33:44:55; fixed-address 192.0.2.1; }
+EOF
+
+PATH="$TEMP_DIR/bin:$PATH" "$ROOT_DIR/bin/fhm" \
+    -i 10 -g "$TEMP_DIR/collapse.conf" >"$TEMP_DIR/collapse-off.out" 2>&1 &
+MONITOR_PID=$!
+
+for _ in {1..50}; do
+    if grep -qE 'c1n1r1e1[[:space:]]' "$TEMP_DIR/collapse-off.out" &&
+        grep -qE 'c2n1r1e1[[:space:]]' "$TEMP_DIR/collapse-off.out"; then
+        break
+    fi
+    sleep 0.1
+done
+
+if ! grep -qE 'c1n1r1e1[[:space:]]' "$TEMP_DIR/collapse-off.out" ||
+    ! grep -qE 'c2n1r1e1[[:space:]]' "$TEMP_DIR/collapse-off.out"; then
+    cat "$TEMP_DIR/collapse-off.out" >&2
+    exit 1
+fi
+
+kill "$MONITOR_PID" 2>/dev/null || true
+wait "$MONITOR_PID" 2>/dev/null || true
+MONITOR_PID=''
+printf 'fhm down core switch still shows hosts without -c passed\n'
+
+PATH="$TEMP_DIR/bin:$PATH" "$ROOT_DIR/bin/fhm" \
+    -c -i 10 -g "$TEMP_DIR/collapse.conf" >"$TEMP_DIR/collapse-down.out" 2>&1 &
+MONITOR_PID=$!
+
+for _ in {1..50}; do
+    if grep -qF '[c1]' "$TEMP_DIR/collapse-down.out" &&
+        grep -qF '10.204.7.134' "$TEMP_DIR/collapse-down.out" &&
+        grep -qE 'c2n1r1e1[[:space:]]' "$TEMP_DIR/collapse-down.out" &&
+        grep -qF 'A_OCTE001' "$TEMP_DIR/collapse-down.out"; then
+        break
+    fi
+    sleep 0.1
+done
+
+if ! grep -qF '[c1]' "$TEMP_DIR/collapse-down.out" ||
+    ! grep -qF '10.204.7.134' "$TEMP_DIR/collapse-down.out" ||
+    ! grep -qE 'c2n1r1e1[[:space:]]' "$TEMP_DIR/collapse-down.out" ||
+    ! grep -qF 'A_OCTE001' "$TEMP_DIR/collapse-down.out"; then
+    cat "$TEMP_DIR/collapse-down.out" >&2
+    exit 1
+fi
+if grep -qE 'c1n1r1e1[[:space:]]' "$TEMP_DIR/collapse-down.out" ||
+    grep -qE 'c1n1r1e1sw[[:space:]]' "$TEMP_DIR/collapse-down.out"; then
+    printf 'collapsed core still listed enclosure hosts\n' >&2
+    cat "$TEMP_DIR/collapse-down.out" >&2
+    exit 1
+fi
+
+kill "$MONITOR_PID" 2>/dev/null || true
+wait "$MONITOR_PID" 2>/dev/null || true
+MONITOR_PID=''
+printf 'fhm collapse hides unpingable cores passed\n'
